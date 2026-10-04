@@ -20,7 +20,7 @@
     },
     "benchmark_concurrency": [1, 2, 4, 8],
     "max_trials": 40,
-    "max_total_benchmarks": 240,
+    "max_total_benchmarks": 400,
     "max_rounds": 12,
     "final_validation_repeats": 3,
     "limits": {
