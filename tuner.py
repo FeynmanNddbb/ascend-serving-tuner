@@ -116,7 +116,7 @@ class Runner:
         self.rows = []
         self.idx = 0
         self.max_total_benchmarks = int(
-            config.get("auto_tune", {}).get("max_total_benchmarks", 240)
+            config.get("auto_tune", {}).get("max_total_benchmarks", 400)
         )
 
     def trial(self, server, input_len, concurrency, label=""):
@@ -322,7 +322,7 @@ def adaptive(config, runner):
         rows = []
         for concurrency in concurrencies:
             rows.append(runner.trial(server, context, concurrency, "adaptive_search"))
-        feasible = [row for row in rows if satisfies(row, limits)]
+        metric_by_objective = {\n            "throughput": "output_throughput",\n            "request_throughput": "request_throughput",\n            "latency": "mean_tpot_ms",\n            "max_capacity": "client_concurrency",\n        }\n        metric = metric_by_objective[objective]\n        feasible = [row for row in rows if satisfies(row, limits) and row.get(metric) is not None]
         best_row = max(feasible, key=lambda row: rank_key(row, objective)) if feasible else None
         result = (rank_key(best_row, objective), best_row) if best_row else (None, None)
         evaluated[key] = result
