@@ -23,7 +23,7 @@
 本项目提供：
 - 从候选参数的低值起步，进行离散坐标搜索。
 - 使用最低吞吐、最大 TTFT、最大 TPOT 作为可配置筛选条件。
-- 支持输出吞吐、请求吞吐或 TPOT 延迟三种目标；当前版本不搜索客户端最大并发。
+- 每个候选的客户端压测并发自动设为该候选的服务端 `max_num_seqs`；客户端并发不单独搜索。
 - 保存每次试验日志、CSV 汇总和推荐配置。
 - 搜索完成后可自动启动推荐配置的服务。
 
@@ -96,7 +96,6 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
       "max_num_batched_tokens": [1024, 2048, 4096, 8192, 16384],
       "gpu_memory_utilization": [0.80, 0.85, 0.90, 0.93]
     },
-    "benchmark_concurrency": [1, 2, 4, 8],
     "max_trials": 40,
     "max_rounds": 12,
     "limits": {
@@ -129,7 +128,7 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 | `max_num_seqs` | `auto_tune.search_space` | `[1, 2, 4, 8, 16, 32]` | 服务端可调度的序列数上限候选。 | 从 `[1, 2, 4]` 起步；吞吐仍随并发提升且延迟、内存满足限制时，再扩展到 8、16、32。它不是客户端并发。 |
 | `max_num_batched_tokens` | `auto_tune.search_space` | `[1024, 2048, 4096, 8192, 16384]` | 单次调度迭代可处理的 token 上限候选。 | 建议先用 `[1024, 2048, 4096]`；Prefill 吞吐受限时逐步提高，若启动失败、内存压力增大或延迟恶化则回退。 |
 | `gpu_memory_utilization` | `auto_tune.search_space` | `[0.80, 0.85, 0.90, 0.93]` | vLLM 设备内存利用率候选。 | 从 `0.80` 或 `0.85` 开始；稳定后再尝试更高值。不要直接设到 1.0；确认当前 vLLM-Ascend 版本支持该参数。 |
-| `fixed_concurrency` | `benchmark` | `1` | 固定压测并发，只作为测量条件，不参与服务端参数搜索。 | 默认固定为 `1`，整个搜索和最终复测均使用该值；如需模拟固定负载，可手动设置为 2、4 等，但脚本不会遍历它。 |
+| `max_num_seqs` | `auto_tune.search_space` | `[1, 2, 4, 8, 16, 32]` | 服务端调度上限候选，同时决定该候选的客户端压测并发。 | 手动填写希望测试的并发档位，例如 `[1, 2, 4, 8]`。每个候选启动服务后，压测客户端并发自动取同一个候选值；不需要另设客户端并发列表。 |
 | `objective` | `auto_tune` | `"throughput"` | 优化目标。 | 吞吐优先选 `"throughput"`；请求处理速率选 `"request_throughput"`；生成延迟选 `"latency"`；当前不提供客户端容量搜索目标。 |
 
 ### 性能限制（SLO）
@@ -153,7 +152,6 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
     "max_num_batched_tokens": [1024, 2048, 4096, 8192, 16384],
     "gpu_memory_utilization": [0.80, 0.85, 0.90, 0.93]
   },
-  "benchmark_concurrency": [1, 2, 4, 8],
   "limits": {
     "min_output_throughput": 0,
     "max_mean_ttft_ms": 10000,
@@ -174,7 +172,7 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 | `launch_best` | 搜索结束后是否启动推荐服务 | `true` 会让最终服务留在后台运行 |
 | `auto_tune.tensor_parallel_size` | 张量并行度 | 固定值，不参与搜索；必须与设备和模型适配 |
 | `auto_tune.enable_chunked_prefill` | 是否启用 Chunked Prefill | 固定开关，不参与搜索；需确认当前版本支持 |
-| `auto_tune.max_trials` | 最多评估的不同参数点数 | 越大搜索更充分、耗时也越长；每个点会测试所有客户端并发候选 |\n| `auto_tune.max_total_benchmarks` | 所有搜索与复测的 benchmark 总次数硬上限 | 防止候选点数 × 客户端并发 × 最终复测造成意外长时间运行；预算不足会明确报错 |\n| `auto_tune.final_validation_repeats` | 最终候选的独立复测次数 | 默认 3 次；候选必须每次通过 SLO 才会被推荐，否则尝试下一候选；全部失败则不启动服务 |
+| `auto_tune.max_trials` | 最多评估的不同参数点数 | 越大搜索更充分、耗时也越长；每个点按对应 `max_num_seqs` 设置客户端压测并发 |\n| `auto_tune.max_total_benchmarks` | 所有搜索与复测的 benchmark 总次数硬上限 | 防止候选点数 × 客户端并发 × 最终复测造成意外长时间运行；预算不足会明确报错 |\n| `auto_tune.final_validation_repeats` | 最终候选的独立复测次数 | 默认 3 次；候选必须每次通过 SLO 才会被推荐，否则尝试下一候选；全部失败则不启动服务 |
 | `auto_tune.max_rounds` | 坐标搜索迭代轮数上限 | 防止搜索时间无限增长 |
 | `benchmark.output_len` | 每个请求生成的 token 数 | 同时影响服务端所需最大模型长度 |
 | `benchmark.num_prompts` | 每次 benchmark 请求数 | 数量太少指标波动较大；增加会延长实验 |
@@ -196,7 +194,7 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 
 ## 7. 搜索方法与注意事项
 
-程序从候选参数的低值起步，通过离散坐标爬山测试相邻候选；只有约束通过且目标指标改善时才移动。该方法比完整笛卡尔积搜索节省试验数，但可能陷入局部最优。搜索阶段每个服务端配置都会测试所有 `benchmark_concurrency`；最终按目标选出的候选会进行 `final_validation_repeats` 次复测，全部通过 SLO 才会写入推荐并允许自动启动。\n\n本版本不遍历客户端并发。`benchmark.fixed_concurrency` 是单一固定测量负载，搜索过程中不会变化；调优维度只包含服务端参数。服务端 `max_num_seqs` 仍然是被搜索的调度上限。
+程序从候选参数的低值起步，通过离散坐标爬山测试相邻候选；只有约束通过且目标指标改善时才移动。该方法比完整笛卡尔积搜索节省试验数，但可能陷入局部最优。每次测试时，客户端 `--max-concurrency` 自动设置为当前候选的服务端 `max_num_seqs`；最终候选按同样规则进行 `final_validation_repeats` 次复测，全部通过 SLO 才会写入推荐并允许自动启动。\n\n客户端并发不作为独立搜索维度，而是与当前候选的服务端 `max_num_seqs` 一一对应。请用户在 `auto_tune.search_space` 的各个参数列表中手动填写希望测试的候选值；列表越大，搜索越久。
 
 - 运行前在当前 shell 执行正确的 CANN `set_env.sh`。配置中的 `cann_env` 路径（若有）不会被脚本自动 source。
 - vLLM 与 vLLM-Ascend 参数支持随版本变化；先检查本机 `vllm serve --help` 和 `vllm bench serve --help`。
