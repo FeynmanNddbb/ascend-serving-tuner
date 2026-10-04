@@ -23,7 +23,7 @@
 本项目提供：
 - 从候选参数的低值起步，进行离散坐标搜索。
 - 使用最低吞吐、最大 TTFT、最大 TPOT 作为可配置筛选条件。
-- 支持输出吞吐、请求吞吐、TPOT 延迟或最大可承载客户端并发四种目标。
+- 支持输出吞吐、请求吞吐或 TPOT 延迟三种目标；当前版本不搜索客户端最大并发。
 - 保存每次试验日志、CSV 汇总和推荐配置。
 - 搜索完成后可自动启动推荐配置的服务。
 
@@ -129,8 +129,8 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 | `max_num_seqs` | `auto_tune.search_space` | `[1, 2, 4, 8, 16, 32]` | 服务端可调度的序列数上限候选。 | 从 `[1, 2, 4]` 起步；吞吐仍随并发提升且延迟、内存满足限制时，再扩展到 8、16、32。它不是客户端并发。 |
 | `max_num_batched_tokens` | `auto_tune.search_space` | `[1024, 2048, 4096, 8192, 16384]` | 单次调度迭代可处理的 token 上限候选。 | 建议先用 `[1024, 2048, 4096]`；Prefill 吞吐受限时逐步提高，若启动失败、内存压力增大或延迟恶化则回退。 |
 | `gpu_memory_utilization` | `auto_tune.search_space` | `[0.80, 0.85, 0.90, 0.93]` | vLLM 设备内存利用率候选。 | 从 `0.80` 或 `0.85` 开始；稳定后再尝试更高值。不要直接设到 1.0；确认当前 vLLM-Ascend 版本支持该参数。 |
-| `benchmark_concurrency` | `auto_tune` | `[1, 2, 4, 8]` | 客户端压测并发请求数候选，用于模拟负载；不等于服务端 `max_num_seqs`。 | 先用 `[1, 2, 4]` 验证单请求和轻负载，再逐步加入 8、16；按预期线上并发设置，不要只追求最高吞吐。 |
-| `objective` | `auto_tune` | `"throughput"` | 优化目标。 | 吞吐优先选 `"throughput"`；请求处理速率选 `"request_throughput"`；生成延迟选 `"latency"`；寻找满足 SLO 的最大客户端并发选 `"max_capacity"`。 |
+| `fixed_concurrency` | `auto_tune` | `[1, 2, 4, 8]` | 客户端压测并发请求数候选，用于模拟负载；不等于服务端 `max_num_seqs`。 | 默认固定为 `1`，整个搜索和最终复测均使用该值；如需模拟固定负载，可手动设置为 2、4 等，但脚本不会遍历它。 |
+| `objective` | `auto_tune` | `"throughput"` | 优化目标。 | 吞吐优先选 `"throughput"`；请求处理速率选 `"request_throughput"`；生成延迟选 `"latency"`；当前不提供客户端容量搜索目标。 |
 
 ### 性能限制（SLO）
 
@@ -196,7 +196,7 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 
 ## 7. 搜索方法与注意事项
 
-程序从候选参数的低值起步，通过离散坐标爬山测试相邻候选；只有约束通过且目标指标改善时才移动。该方法比完整笛卡尔积搜索节省试验数，但可能陷入局部最优。搜索阶段每个服务端配置都会测试所有 `benchmark_concurrency`；最终按目标选出的候选会进行 `final_validation_repeats` 次复测，全部通过 SLO 才会写入推荐并允许自动启动。\n\n客户端 `benchmark_concurrency` 可以大于服务端 `max_num_seqs`：前者表示压测端同时发出的请求，后者是服务端调度序列上限。超出的请求会排队，这正是测量过载、排队延迟和容量边界时需要覆盖的情况。推荐结果同时记录两者，不能把客户端并发误读为服务端并行执行数。
+程序从候选参数的低值起步，通过离散坐标爬山测试相邻候选；只有约束通过且目标指标改善时才移动。该方法比完整笛卡尔积搜索节省试验数，但可能陷入局部最优。搜索阶段每个服务端配置都会测试所有 `benchmark_concurrency`；最终按目标选出的候选会进行 `final_validation_repeats` 次复测，全部通过 SLO 才会写入推荐并允许自动启动。\n\n本版本不遍历客户端并发。`benchmark.fixed_concurrency` 是单一固定测量负载，搜索过程中不会变化；调优维度只包含服务端参数。服务端 `max_num_seqs` 仍然是被搜索的调度上限。
 
 - 运行前在当前 shell 执行正确的 CANN `set_env.sh`。配置中的 `cann_env` 路径（若有）不会被脚本自动 source。
 - vLLM 与 vLLM-Ascend 参数支持随版本变化；先检查本机 `vllm serve --help` 和 `vllm bench serve --help`。
