@@ -23,7 +23,7 @@
 本项目提供：
 - 从候选参数的低值起步，进行离散坐标搜索。
 - 使用最低吞吐、最大 TTFT、最大 TPOT 作为可配置筛选条件。
-- 以输出吞吐、请求吞吐或 TPOT 作为优化目标。
+- 支持输出吞吐、请求吞吐、TPOT 延迟或最大可承载客户端并发四种目标。
 - 保存每次试验日志、CSV 汇总和推荐配置。
 - 搜索完成后可自动启动推荐配置的服务。
 
@@ -130,7 +130,7 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 | `max_num_batched_tokens` | `auto_tune.search_space` | `[1024, 2048, 4096, 8192, 16384]` | 单次调度迭代可处理的 token 上限候选。 | 建议先用 `[1024, 2048, 4096]`；Prefill 吞吐受限时逐步提高，若启动失败、内存压力增大或延迟恶化则回退。 |
 | `gpu_memory_utilization` | `auto_tune.search_space` | `[0.80, 0.85, 0.90, 0.93]` | vLLM 设备内存利用率候选。 | 从 `0.80` 或 `0.85` 开始；稳定后再尝试更高值。不要直接设到 1.0；确认当前 vLLM-Ascend 版本支持该参数。 |
 | `benchmark_concurrency` | `auto_tune` | `[1, 2, 4, 8]` | 客户端压测并发请求数候选，用于模拟负载；不等于服务端 `max_num_seqs`。 | 先用 `[1, 2, 4]` 验证单请求和轻负载，再逐步加入 8、16；按预期线上并发设置，不要只追求最高吞吐。 |
-| `objective` | `auto_tune` | `"throughput"` | 优化目标。 | 吞吐优先选 `"throughput"`；请求处理速率优先选 `"request_throughput"`；生成流畅度优先选 `"latency"`，并配合 TPOT 上限。 |
+| `objective` | `auto_tune` | `"throughput"` | 优化目标。 | 吞吐优先选 `"throughput"`；请求处理速率选 `"request_throughput"`；生成延迟选 `"latency"`；寻找满足 SLO 的最大客户端并发选 `"max_capacity"`。 |
 
 ### 性能限制（SLO）
 
@@ -174,7 +174,7 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 | `launch_best` | 搜索结束后是否启动推荐服务 | `true` 会让最终服务留在后台运行 |
 | `auto_tune.tensor_parallel_size` | 张量并行度 | 固定值，不参与搜索；必须与设备和模型适配 |
 | `auto_tune.enable_chunked_prefill` | 是否启用 Chunked Prefill | 固定开关，不参与搜索；需确认当前版本支持 |
-| `auto_tune.max_trials` | 最多评估的不同参数点数 | 越大搜索更充分、耗时也越长；每个点会测试所有客户端并发候选 |
+| `auto_tune.max_trials` | 最多评估的不同参数点数 | 越大搜索更充分、耗时也越长；每个点会测试所有客户端并发候选 |\n| `auto_tune.max_total_benchmarks` | 所有搜索与复测的 benchmark 总次数硬上限 | 防止候选点数 × 客户端并发 × 最终复测造成意外长时间运行；预算不足会明确报错 |\n| `auto_tune.final_validation_repeats` | 最终候选的独立复测次数 | 默认 3 次；候选必须每次通过 SLO 才会被推荐，否则尝试下一候选；全部失败则不启动服务 |
 | `auto_tune.max_rounds` | 坐标搜索迭代轮数上限 | 防止搜索时间无限增长 |
 | `benchmark.output_len` | 每个请求生成的 token 数 | 同时影响服务端所需最大模型长度 |
 | `benchmark.num_prompts` | 每次 benchmark 请求数 | 数量太少指标波动较大；增加会延长实验 |
@@ -196,7 +196,7 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 
 ## 7. 搜索方法与注意事项
 
-程序从候选参数的低值起步，通过离散坐标爬山测试相邻候选；只有约束通过且目标指标改善时才移动。该方法比完整笛卡尔积搜索节省试验数，但可能陷入局部最优。建议对最终推荐点进行多轮复测。
+程序从候选参数的低值起步，通过离散坐标爬山测试相邻候选；只有约束通过且目标指标改善时才移动。该方法比完整笛卡尔积搜索节省试验数，但可能陷入局部最优。搜索阶段每个服务端配置都会测试所有 `benchmark_concurrency`；最终按目标选出的候选会进行 `final_validation_repeats` 次复测，全部通过 SLO 才会写入推荐并允许自动启动。\n\n客户端 `benchmark_concurrency` 可以大于服务端 `max_num_seqs`：前者表示压测端同时发出的请求，后者是服务端调度序列上限。超出的请求会排队，这正是测量过载、排队延迟和容量边界时需要覆盖的情况。推荐结果同时记录两者，不能把客户端并发误读为服务端并行执行数。
 
 - 运行前在当前 shell 执行正确的 CANN `set_env.sh`。配置中的 `cann_env` 路径（若有）不会被脚本自动 source。
 - vLLM 与 vLLM-Ascend 参数支持随版本变化；先检查本机 `vllm serve --help` 和 `vllm bench serve --help`。
