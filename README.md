@@ -2,12 +2,12 @@
 
 # Ascend Serving Tuner
 
-**面向 vLLM / vLLM-Ascend 的自适应推理服务参数调优工具**
+**基于 vLLM Bench 的 vLLM / vLLM-Ascend 推理服务参数调优工具**
 
-从较低配置开始逐步探索上下文长度、服务端并发、Batch Tokens 与显存利用率；可设置吞吐、TTFT、TPOT 约束，并在搜索结束后按推荐参数启动服务。
+通过自动启动服务、调用 `vllm bench serve` 发起压测、解析性能指标并搜索服务端配置，帮助评估长上下文与并发场景下的 Serving 性能。
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![vLLM](https://img.shields.io/badge/vLLM-Serving-6C5CE7)
+![vLLM](https://img.shields.io/badge/Benchmark-vllm%20bench-6C5CE7)
 ![Ascend](https://img.shields.io/badge/Ascend-NPU-FF6B35)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Status](https://img.shields.io/badge/Status-Experimental-orange)
@@ -16,64 +16,136 @@
 
 ---
 
-## 1. 项目简介
+## 项目简介
 
-大模型 Serving 参数彼此影响：上下文越长，KV Cache 占用越高；并发和批处理 token 上限会改变吞吐、排队与延迟。手动试参容易遗漏组合，完整网格搜索又可能耗时很长。
+大模型推理服务的上下文长度、调度并发、Batch Tokens 和显存利用率相互影响。手动试参容易遗漏配置，完整笛卡尔积搜索则可能带来大量启动与压测开销。
 
-本项目提供：
-- 从候选参数的低值起步，进行离散坐标搜索。
-- 使用最低吞吐、最大 TTFT、最大 TPOT 作为可配置筛选条件。
-- 每个候选的客户端压测并发自动设为该候选的服务端 `max_num_seqs`；客户端并发不单独搜索。
-- 保存每次试验日志、CSV 汇总和推荐配置。
-- 搜索完成后可自动启动推荐配置的服务。
+本项目围绕 **vLLM 自带的 `vllm bench serve`** 构建实验闭环：
 
-> 搜索算法为离散坐标爬山，不是连续数学梯度法，也不保证全局最优。结果只对当前模型、设备、软件版本、候选空间和压测负载有效。
+1. 从配置文件读取模型、设备、服务端候选参数与压测条件。
+2. 启动一个候选 vLLM / vLLM-Ascend 服务，并等待 `/v1/models` 健康检查。
+3. 调用 `vllm bench serve`，通过 OpenAI-compatible Chat Completions API 发起请求。
+4. 将 benchmark 结果保存为 JSON，解析吞吐、TTFT、TPOT 等指标。
+5. 按 SLO 过滤候选，并依据目标指标进行离散坐标搜索。
+6. 对候选结果重复验证；通过后写出推荐配置，可选择启动推荐服务。
 
-## 2. 快速部署
+当前 adaptive 模式中，客户端压测并发自动等于当前候选的服务端 `max_num_seqs`。**用户只需在参数列表中手动填写希望测试的候选值，不需要单独配置客户端并发列表。**
 
-### 2.1 先修改这几个部署参数
+> 本项目是实验性参数调优工具，不保证全局最优。结果仅适用于本次模型、硬件、软件版本、候选参数和压测负载。当前尚未在所有 vLLM-Ascend 版本与设备组合上完成兼容性验证。
 
-**首次部署只需要优先核对以下项目；其余搜索和压测参数可先保留默认值。**
+## 工作流程
 
-| 参数 | 必须做什么 | 示例 |
-|---|---|---|
-| `model` | 改为本机模型目录 | `/workspace/work/data/models/Qwen3.8-27B-w8a8` |
-| `visible_devices` | 改为本次分配给服务的设备编号 | 双卡：`"0,1"`；单卡：`"0"` |
-| `auto_tune.tensor_parallel_size` | 与设备数及模型并行方式匹配 | 双卡 TP：`2` |
-| `port` | 确保端口空闲；搜索会反复启动/停止测试服务 | `8000` |
-| `served_model_name` | 设定 API 使用的模型名；保持服务和 benchmark 一致 | `"qwen3.8"` |
-| CANN 环境 | 按机器实际安装路径初始化环境 | 见下方命令 |
+```text
+config.json
+    |
+    v
+选择服务端候选参数
+    |
+    v
+启动 vllm serve
+    |
+    v
+等待 /v1/models 就绪
+    |
+    v
+vllm bench serve
+  --random-input-len
+  --random-output-len
+  --num-prompts
+  --max-concurrency = max_num_seqs
+    |
+    v
+benchmark.json + benchmark.log
+    |
+    v
+解析指标 / 检查 SLO / 记录 summary.csv
+    |
+    v
+离散坐标搜索 + 最终重复验证
+    |
+    v
+recommendation.json
+    |
+    +---- launch_best=true ---> 启动推荐配置
+```
 
-`host` 默认是 `127.0.0.1`，适合本机压测。只有确实需要其他机器访问时才修改，并遵循网络访问控制；不要无认证地暴露到公网。
+## 主要能力
 
-### 2.2 安装与运行
+- **vLLM Bench 压测**：通过 `vllm bench serve` 对已启动的 OpenAI-compatible 服务发起请求，不是自定义 HTTP 压测器。
+- **服务端参数搜索**：上下文长度、`max_num_seqs`、`max_num_batched_tokens`、`gpu_memory_utilization`。
+- **并发联动**：每个候选的客户端 `--max-concurrency` 取该候选的 `max_num_seqs`。
+- **目标与 SLO**：输出吞吐、请求吞吐或 TPOT 延迟作为目标；支持最低输出吞吐、最大平均 TTFT、最大平均 TPOT 约束。
+- **可追溯实验**：保存服务日志、benchmark 日志、原始结果 JSON、CSV 汇总和推荐配置。
+- **最终复测**：对排名靠前的候选重复 benchmark；每次均通过约束才推荐。
+- **可选启动**：搜索成功后可自动启动推荐服务。
+
+## 环境要求
+
+- Linux 环境，已安装并可在当前 shell 中调用 `vllm`。
+- Python 3.10+。
+- vLLM 或与当前设备匹配的 vLLM-Ascend、PyTorch、CANN 等运行环境。
+- 模型权重已在本机可访问的目录中。
+- 压测端口空闲，设备没有其他进程占用或干扰实验。
+
+对于 Ascend，运行前按实际安装路径初始化 CANN，例如：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+```
+
+先确认当前版本命令参数：
+
+```bash
+vllm serve --help
+vllm bench serve --help
+```
+
+vLLM 与 vLLM-Ascend 的 CLI 参数会随版本变化；若本机不支持脚本使用的参数，应先适配版本，不要直接把其他版本的 benchmark 命令当作兼容保证。
+
+## 快速开始
 
 ```bash
 git clone https://github.com/FeynmanNddbb/ascend-serving-tuner.git
 cd ascend-serving-tuner
 cp config.example.json config.json
+```
 
-# 按本机 CANN 安装位置修改路径
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
+编辑 `config.json`，至少确认模型路径、设备、TP、端口和候选参数。先执行 dry-run 查看模式与配置：
 
-# 先检查配置与将要执行的模式
+```bash
 python3 tuner.py --config config.json --mode adaptive --dry-run
+```
 
-# 执行搜索；launch_best=true 时结束后自动启动推荐服务
+开始调优：
+
+```bash
 python3 tuner.py --config config.json --mode adaptive
 ```
 
-只搜索、不启动最终服务：
+只搜索、不启动最终推荐服务：
 
 ```bash
 python3 tuner.py --config config.json --mode adaptive --no-launch-best
 ```
 
-**注意：** 请在空闲端口和专用实验环境运行。程序只应管理它自己启动的测试实例；不要把端口指向已有业务服务。
+请在专用实验环境与空闲端口运行。脚本会反复启动和停止自己创建的服务实例；不要将端口指向正在承载业务流量的服务。
 
-## 3. 配置示例
+## 配置说明
 
-下面示例适用于双设备 Ascend 环境。部署时先按上一节修改模型路径、设备、TP 和端口。
+### 首次需要修改的参数
+
+| 参数 | 用途 | 示例 |
+|---|---|---|
+| `model` | 本机模型目录 | `/workspace/work/data/models/Qwen3.8-27B-w8a8` |
+| `served_model_name` | API 暴露的模型名，服务端与 benchmark 保持一致 | `qwen3.8` |
+| `visible_devices` | 本次实验可见设备 | 双卡 `"0,1"` |
+| `auto_tune.tensor_parallel_size` | 张量并行度 | 双卡 TP=2 |
+| `host` / `port` | 服务监听与压测地址 | `127.0.0.1:8000` |
+| `auto_tune.search_space` | 手动填写待测试候选列表 | 见下方 |
+
+### 示例配置
+
+以下是双设备 Ascend 示例。**请按目标机器能力调整候选列表；不要将示例中的 128K/256K 或并发档位视为硬件保证。**
 
 ```json
 {
@@ -91,13 +163,15 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
     "tensor_parallel_size": 2,
     "enable_chunked_prefill": true,
     "search_space": {
-      "context_lengths": [4096, 8192, 16384, 32768, 65536, 131072],
-      "max_num_seqs": [1, 2, 4, 8, 16, 32],
-      "max_num_batched_tokens": [1024, 2048, 4096, 8192, 16384],
-      "gpu_memory_utilization": [0.80, 0.85, 0.90, 0.93]
+      "context_lengths": [8192, 16384, 32768, 65536],
+      "max_num_seqs": [1, 2, 4, 8, 16],
+      "max_num_batched_tokens": [2048, 4096, 8192, 16384],
+      "gpu_memory_utilization": [0.85, 0.90, 0.93]
     },
     "max_trials": 40,
+    "max_total_benchmarks": 400,
     "max_rounds": 12,
+    "final_validation_repeats": 3,
     "limits": {
       "min_output_throughput": 0,
       "max_mean_ttft_ms": 10000,
@@ -118,92 +192,106 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 }
 ```
 
-## 4. 核心调优参数
+### 服务端参数候选
 
-下面直接使用 `config.json` 中的**原始参数名**。参数配置指南给出首次试验和逐步调整的建议；实际最佳值需由目标硬件、模型和业务负载实测确定。
+| 参数 | 含义 | 配置建议 |
+|---|---|---|
+| `context_lengths` | 随机输入长度候选，单位 token | 先从 4K/8K/16K 开始，确认稳定后再增加长上下文档位。服务端 `max_model_len = context_length + output_len`。 |
+| `max_num_seqs` | 服务端调度序列数上限 | 手动填写希望测的并发档位，如 `[1, 2, 4, 8]`。当前候选的客户端压测并发会自动设为同一数值。 |
+| `max_num_batched_tokens` | 单次调度迭代的 token 上限 | 从较低值开始，逐步观察吞吐、延迟与显存变化。 |
+| `gpu_memory_utilization` | vLLM 设备内存利用率 | 从保守值开始，逐步提高；确认当前后端版本支持该参数。 |
 
-| 参数名 | 所在位置 | 示例 | 作用 | 参数配置指南 |
-|---|---|---|---|---|
-| `context_lengths` | `auto_tune.search_space` | `[4096, 8192, 16384, 32768, 65536, 131072]` | 输入上下文长度候选，单位 token。脚本将 `benchmark.output_len` 加到服务端 `max_model_len`。 | 初次建议从 `[4096, 8192, 16384]` 开始；确认稳定后再逐级加入 32K、64K、128K。长上下文要同时关注 KV Cache、TTFT 和 OOM。 |
-| `max_num_seqs` | `auto_tune.search_space` | `[1, 2, 4, 8, 16, 32]` | 服务端调度上限候选，同时决定该候选的客户端压测并发。 | 用户手动填写希望测试的并发档位，例如 `[1, 2, 4, 8]`。每个候选的客户端 `--max-concurrency` 自动取相同值；无需另设客户端并发列表。 |
-| `max_num_batched_tokens` | `auto_tune.search_space` | `[1024, 2048, 4096, 8192, 16384]` | 单次调度迭代可处理的 token 上限候选。 | 建议先用 `[1024, 2048, 4096]`；Prefill 吞吐受限时逐步提高，若启动失败、内存压力增大或延迟恶化则回退。 |
-| `gpu_memory_utilization` | `auto_tune.search_space` | `[0.80, 0.85, 0.90, 0.93]` | vLLM 设备内存利用率候选。 | 从 `0.80` 或 `0.85` 开始；稳定后再尝试更高值。不要直接设到 1.0；确认当前 vLLM-Ascend 版本支持该参数。 |
+### vLLM Bench 压测参数
 
-| `objective` | `auto_tune` | `"throughput"` | 优化目标。 | 吞吐优先选 `"throughput"`；请求处理速率选 `"request_throughput"`；生成延迟选 `"latency"`；当前不提供客户端容量搜索目标。 |
+本项目当前通过以下命令参数组织每次压测（具体命令由脚本按配置生成）：
 
-### 性能限制（SLO）
-
-| 参数名 | 所在位置 | 默认示例 | 作用 | 参数配置指南 |
-|---|---|---:|---|---|
-| `min_output_throughput` | `auto_tune.limits` | `0` | 输出吞吐最低门槛，单位 tokens/s。 | `0` 表示不设有效下限。压测得到基线后，可设为业务最低吞吐要求；不要把单次波动值当硬门槛。 |
-| `max_mean_ttft_ms` | `auto_tune.limits` | `10000` | 平均首 Token 延迟上限，单位 ms。 | 默认值是宽松起步值。交互式业务可按 SLA 收紧，例如先试 2000–3000 ms；长上下文场景需结合输入长度设定。 |
-| `max_mean_tpot_ms` | `auto_tune.limits` | `1000` | 平均每输出 Token 时间上限，单位 ms。 | 默认值宽松。按生成体验要求逐步收紧，例如 80–150 ms；确认 benchmark 输出字段和单位后再设限。 |
-
-以上是配置起点，不是硬件能力保证。若启用的指标无法从当前版本 benchmark JSON 解析，该候选不会通过约束筛选。
-
-### 配置中对应的原样片段
-
-```json
-"auto_tune": {
-  "objective": "throughput",
-  "search_space": {
-    "context_lengths": [4096, 8192, 16384, 32768, 65536, 131072],
-    "max_num_seqs": [1, 2, 4, 8, 16, 32],
-    "max_num_batched_tokens": [1024, 2048, 4096, 8192, 16384],
-    "gpu_memory_utilization": [0.80, 0.85, 0.90, 0.93]
-  },
-  "limits": {
-    "min_output_throughput": 0,
-    "max_mean_ttft_ms": 10000,
-    "max_mean_tpot_ms": 1000
-  }
-}
+```bash
+vllm bench serve \
+  --backend openai-chat \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --endpoint /v1/chat/completions \
+  --model /path/to/model \
+  --served-model-name model \
+  --dataset-name random \
+  --random-input-len 8192 \
+  --random-output-len 128 \
+  --num-prompts 16 \
+  --max-concurrency 8 \
+  --save-result \
+  --result-filename runs/trial/benchmark.json
 ```
 
-## 5. 其他参数说明
+参数映射：
 
-以下参数通常无需首次部署时修改，只有在需要控制实验时间、服务行为或运行环境时再调整。
-
-| 参数 | 作用 | 说明 |
+| 配置项 | 对应 vLLM Bench 参数 | 说明 |
 |---|---|---|
-| `mode` | 默认运行模式 | `adaptive` 自适应搜索；`grid` 固定网格搜索 |
-| `startup_timeout_sec` | 等待服务健康检查的最长时间 | 大模型加载较慢时可增加 |
-| `shutdown_timeout_sec` | 停止测试服务时等待 SIGINT 的时间 | 超时后脚本尝试 terminate/kill |
-| `launch_best` | 搜索结束后是否启动推荐服务 | `true` 会让最终服务留在后台运行 |
-| `auto_tune.tensor_parallel_size` | 张量并行度 | 固定值，不参与搜索；必须与设备和模型适配 |
-| `auto_tune.enable_chunked_prefill` | 是否启用 Chunked Prefill | 固定开关，不参与搜索；需确认当前版本支持 |
-| `auto_tune.max_trials` | 最多评估的不同参数点数 | 越大搜索更充分、耗时也越长；每个点按对应 `max_num_seqs` 设置客户端压测并发 |\n| `auto_tune.max_total_benchmarks` | 所有搜索与复测的 benchmark 总次数硬上限 | 防止候选点数与最终复测次数造成意外长时间运行；预算不足会明确报错 |\n| `auto_tune.final_validation_repeats` | 最终候选的独立复测次数 | 默认 3 次；候选必须每次通过 SLO 才会被推荐，否则尝试下一候选；全部失败则不启动服务 |
-| `auto_tune.max_rounds` | 坐标搜索迭代轮数上限 | 防止搜索时间无限增长 |
-| `benchmark.output_len` | 每个请求生成的 token 数 | 同时影响服务端所需最大模型长度 |
-| `benchmark.num_prompts` | 每次 benchmark 请求数 | 数量太少指标波动较大；增加会延长实验 |
-| `benchmark.backend` | 压测客户端后端 | 示例为 `openai-chat` |
-| `benchmark.dataset_name` | 压测数据类型 | `random` 便于可重复对比，但不等于真实业务请求分布 |
-| `benchmark.extra_args` | 额外传给 `vllm bench serve` 的参数 | 需符合当前安装版本 CLI |
-| `env` | 子进程环境变量 | 示例中的 HCCL 与 NPU allocator 变量不确定时不要随意改 |
+| `benchmark.backend` | `--backend` | 默认 `openai-chat` |
+| `benchmark.dataset_name` | `--dataset-name` | 示例为 `random` |
+| 当前候选上下文长度 | `--random-input-len` | 每个请求的随机输入长度 |
+| `benchmark.output_len` | `--random-output-len` | 每个请求的生成长度 |
+| `benchmark.num_prompts` | `--num-prompts` | 本轮请求总数 |
+| 当前候选 `max_num_seqs` | `--max-concurrency` | 客户端并发自动跟随服务端候选 |
+| 结果文件 | `--save-result --result-filename` | 保存 benchmark JSON |
+| `benchmark.extra_args` | 追加 CLI 参数 | 必须是当前安装版本支持的参数 |
 
-## 6. 搜索结果与自动启动
+**并发测试逻辑示例：** 当候选 `max_num_seqs=8` 时，服务端使用 `--max-num-seqs 8`，vLLM Bench 同时使用 `--max-concurrency 8`；候选为 16 时，两者都变为 16。用户不需要维护第二份客户端并发列表。
 
-每次运行生成 `runs/<timestamp>/`：
+`num_prompts` 应足以覆盖目标并发负载。若请求数少于并发档位，客户端无法持续提供足够请求，压测结果可能低估服务端吞吐。建议根据实验时长和目标场景手动设置请求数。
 
-- `summary.csv`：每次试验的参数、状态与可解析指标。
-- `recommendation.json`：推荐服务参数、优化目标、约束和选中指标。
-- `trial_xxxx/server.log`、`benchmark.log`、`benchmark.json`：单次试验记录。
-- `final_server.json`、`final_server.log`：最终服务的 PID、启动命令和日志。
+### 目标与 SLO
 
-默认 `launch_best: true`。停止服务前，请先核对 PID 和命令确实属于本次 tuner 启动的实例，不要对未知 PID 执行 kill。
+| 参数 | 作用 |
+|---|---|
+| `objective: "throughput"` | 优先最大化输出 token 吞吐 |
+| `objective: "request_throughput"` | 优先最大化请求处理速率 |
+| `objective: "latency"` | 优先降低平均 TPOT；吞吐用于次级比较 |
+| `min_output_throughput` | 输出吞吐最低门槛，tokens/s |
+| `max_mean_ttft_ms` | 平均首 Token 延迟上限，ms |
+| `max_mean_tpot_ms` | 平均每输出 Token 时间上限，ms |
 
-## 7. 搜索方法与注意事项
+约束字段未能从当前版本 benchmark JSON 解析时，该候选无法通过对应 SLO。建议先用少量请求运行一次，检查结果 JSON 字段，再设置严格门槛。
 
-程序从候选参数的低值起步，通过离散坐标爬山测试相邻候选；只有约束通过且目标指标改善时才移动。该方法比完整笛卡尔积搜索节省试验数，但可能陷入局部最优。每次测试时，客户端 `--max-concurrency` 自动设置为当前候选的服务端 `max_num_seqs`；最终候选按同样规则进行 `final_validation_repeats` 次复测，全部通过 SLO 才会写入推荐并允许自动启动。
+## 搜索策略与边界
 
-客户端并发不作为独立搜索维度，而是与当前候选的服务端 `max_num_seqs` 一一对应。请用户在 `auto_tune.search_space` 的各个参数列表中手动填写希望测试的候选值；列表越大，搜索越久。
+- adaptive 模式采用从各维度最低候选起步的**离散坐标爬山**，逐维尝试相邻候选；不是完整笛卡尔积穷举，也不保证全局最优。
+- `max_trials` 限制不同服务端参数点数量。
+- `max_total_benchmarks` 限制搜索和最终验证的 benchmark 总次数。
+- `max_rounds` 限制坐标搜索轮数。
+- `final_validation_repeats` 控制最终候选重复压测次数；候选每次都通过 SLO 才会被推荐。
+- 当前客户端并发不是独立搜索维度，而是由当前候选 `max_num_seqs` 派生。
+- 当前未实现自动设备内存探测、OOM 专项分类回退或 Pareto 多目标优化。
+- 随机数据适合相对参数比较，不等价于真实业务的输入分布、输出分布或到达过程。
 
-- 运行前在当前 shell 执行正确的 CANN `set_env.sh`。配置中的 `cann_env` 路径（若有）不会被脚本自动 source。
-- vLLM 与 vLLM-Ascend 参数支持随版本变化；先检查本机 `vllm serve --help` 和 `vllm bench serve --help`。
-- 当前尚未实现设备内存自动探测、OOM 专项分类回退和多目标 Pareto 优化。
-- 随机数据的 benchmark 适合参数相对比较；生产部署应使用接近真实业务的输入/输出长度与请求分布。
+## 结果目录
 
-## 8. 参考与许可
+每次运行在 `runs/<timestamp>/` 下生成结果：
+
+| 文件 | 内容 |
+|---|---|
+| `summary.csv` | 所有已执行试验的参数、状态与可解析指标 |
+| `recommendation.json` | 推荐服务端配置、目标、SLO、选中指标和搜索信息 |
+| `trial_xxxx/server.log` | 候选服务启动日志 |
+| `trial_xxxx/benchmark.log` | vLLM Bench 标准输出与错误信息 |
+| `trial_xxxx/benchmark.json` | vLLM Bench 原始结果 |
+| `trial_xxxx/config.json` | 本次试验参数及输入长度、客户端并发 |
+| `trial_xxxx/server_command.txt` | 本次服务启动命令 |
+| `final_server.json` / `final_server.log` | 推荐服务的 PID、启动命令与日志 |
+
+默认 `launch_best: true` 会在搜索成功后启动推荐配置并保持运行。停止前请核对 PID 与命令确实属于本次 tuner 实例。
+
+## 常见问题
+
+**为什么客户端并发不单独配置？**  
+当前设计将客户端 `--max-concurrency` 与候选服务端 `max_num_seqs` 对齐，方便比较每个服务端并发档位的表现。它测的是该并发档位下的表现，不等同于独立探索客户端过载/排队曲线。
+
+**为什么某些候选失败？**  
+可能是模型加载失败、设备内存不足、CLI 参数版本不兼容、服务未通过健康检查、benchmark 非零退出或请求失败。查看对应 `server.log` 与 `benchmark.log`。
+
+**为什么搜索结果不一定是全局最优？**  
+adaptive 使用离散坐标爬山并受 `max_trials`、`max_rounds` 限制。想覆盖更多区域，需手动调整候选列表或增加搜索预算。
+
+## 许可与参考
 
 - [vLLM Serve CLI](https://docs.vllm.ai/en/stable/cli/serve/)
 - [vLLM Bench Serve CLI](https://docs.vllm.ai/en/stable/cli/bench/serve/)
