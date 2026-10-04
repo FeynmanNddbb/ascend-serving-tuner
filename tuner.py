@@ -1,217 +1,463 @@
 #!/usr/bin/env python3
 """Adaptive coordinate search for vLLM / vLLM-Ascend serving."""
 from __future__ import annotations
-import argparse, csv, itertools, json, os, signal, subprocess, sys, time, urllib.request
+
+import argparse
+import csv
+import itertools
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-def read_json(path): return json.loads(Path(path).read_text(encoding="utf-8"))
+
+def read_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
 def combinations(server):
-    keys=list(server)
-    for vals in itertools.product(*(server[k] for k in keys)): yield dict(zip(keys,vals))
+    keys = list(server)
+    for vals in itertools.product(*(server[k] for k in keys)):
+        yield dict(zip(keys, vals))
+
+
 def shell_env(c):
-    env=os.environ.copy()
-    env["ASCEND_RT_VISIBLE_DEVICES"]=str(c.get("visible_devices","0,1"))
-    env.update({str(k):str(v) for k,v in c.get("env",{}).items()})
+    env = os.environ.copy()
+    env["ASCEND_RT_VISIBLE_DEVICES"] = str(c.get("visible_devices", "0,1"))
+    env.update({str(k): str(v) for k, v in c.get("env", {}).items()})
     return env
-def make_server_cmd(c,s):
-    cmd=["vllm","serve",c["model"],"--host",c.get("host","127.0.0.1"),"--port",str(c.get("port",8000)),
-         "--served-model-name",c.get("served_model_name","model"),"--tensor-parallel-size",str(s["tensor_parallel_size"]),
-         "--max-model-len",str(s["max_model_len"]),"--max-num-seqs",str(s["max_num_seqs"]),
-         "--max-num-batched-tokens",str(s["max_num_batched_tokens"]),
-         "--gpu-memory-utilization",str(s["gpu_memory_utilization"])]
-    if s.get("enable_chunked_prefill"): cmd.append("--enable-chunked-prefill")
+
+
+def make_server_cmd(c, s):
+    cmd = [
+        "vllm", "serve", c["model"],
+        "--host", c.get("host", "127.0.0.1"),
+        "--port", str(c.get("port", 8000)),
+        "--served-model-name", c.get("served_model_name", "model"),
+        "--tensor-parallel-size", str(s["tensor_parallel_size"]),
+        "--max-model-len", str(s["max_model_len"]),
+        "--max-num-seqs", str(s["max_num_seqs"]),
+        "--max-num-batched-tokens", str(s["max_num_batched_tokens"]),
+        "--gpu-memory-utilization", str(s["gpu_memory_utilization"]),
+    ]
+    if s.get("enable_chunked_prefill"):
+        cmd.append("--enable-chunked-prefill")
     return cmd
-def wait_health(url,proc,timeout):
-    end=time.time()+timeout
-    while time.time()<end:
-        if proc.poll() is not None: return False,f"server exited {proc.returncode}"
+
+
+def wait_health(url, proc, timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        if proc.poll() is not None:
+            return False, f"server exited {proc.returncode}"
         try:
-            with urllib.request.urlopen(url,timeout=3) as r:
-                if r.status==200:return True,"ready"
-        except Exception:pass
+            with urllib.request.urlopen(url, timeout=3) as response:
+                if response.status == 200:
+                    return True, "ready"
+        except Exception:
+            pass
         time.sleep(3)
-    return False,"health check timeout"
-def stop_process(proc,timeout):
-    if proc is None or proc.poll() is not None:return
+    return False, "health check timeout"
+
+
+def stop_process(proc, timeout):
+    if proc is None or proc.poll() is not None:
+        return
     proc.send_signal(signal.SIGINT)
-    try:proc.wait(timeout=timeout)
+    try:
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.terminate()
-        try:proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 def parse_metrics(path):
-    p=Path(path)
-    if not p.exists():return {}
-    try:d=json.loads(p.read_text(encoding="utf-8"))
-    except Exception:return {}
-    if isinstance(d,list) and d:d=d[-1]
-    if not isinstance(d,dict):return {}
-    aliases={"request_throughput":["request_throughput","req_throughput"],
-      "output_throughput":["output_throughput","output_token_throughput"],
-      "mean_ttft_ms":["mean_ttft_ms","ttft_mean_ms"],"mean_tpot_ms":["mean_tpot_ms","tpot_mean_ms"],
-      "mean_itl_ms":["mean_itl_ms","itl_mean_ms"],"completed":["successful_requests","completed","num_completed"],
-      "failed":["failed_requests","failed","num_failed"]}
-    out={}
-    for dst,names in aliases.items():
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if isinstance(data, list) and data:
+        data = data[-1]
+    if not isinstance(data, dict):
+        return {}
+    aliases = {
+        "request_throughput": ["request_throughput", "req_throughput"],
+        "output_throughput": ["output_throughput", "output_token_throughput"],
+        "mean_ttft_ms": ["mean_ttft_ms", "ttft_mean_ms"],
+        "mean_tpot_ms": ["mean_tpot_ms", "tpot_mean_ms"],
+        "mean_itl_ms": ["mean_itl_ms", "itl_mean_ms"],
+        "completed": ["successful_requests", "completed", "num_completed"],
+        "failed": ["failed_requests", "failed", "num_failed"],
+    }
+    out = {}
+    for dst, names in aliases.items():
         for name in names:
-            if name in d:out[dst]=d[name];break
+            if name in data:
+                out[dst] = data[name]
+                break
     return out
 
+
 class Runner:
-    def __init__(self,c,base):self.c,self.base,self.rows,self.idx=c,base,[],0
-    def trial(self,s,input_len,conc,label=""):
-        self.idx+=1; tid=f"trial_{self.idx:04d}"; d=self.base/tid;d.mkdir(parents=True,exist_ok=True)
-        (d/"config.json").write_text(json.dumps({"server":s,"input_len":input_len,"client_concurrency":conc,"label":label},indent=2))
-        row={"trial":tid,**s,"input_len":input_len,"client_concurrency":conc,"label":label,"status":"error"}
-        proc=None
-        with open(d/"server.log","w",encoding="utf-8") as sl,open(d/"benchmark.log","w",encoding="utf-8") as bl:
+    def __init__(self, config, base):
+        self.c = config
+        self.base = base
+        self.rows = []
+        self.idx = 0
+        self.max_total_benchmarks = int(
+            config.get("auto_tune", {}).get("max_total_benchmarks", 240)
+        )
+
+    def trial(self, server, input_len, concurrency, label=""):
+        if self.idx >= self.max_total_benchmarks:
+            raise RuntimeError(
+                f"max_total_benchmarks={self.max_total_benchmarks} reached; "
+                "increase the budget or reduce candidate/concurrency counts"
+            )
+        self.idx += 1
+        tid = f"trial_{self.idx:04d}"
+        directory = self.base / tid
+        directory.mkdir(parents=True, exist_ok=True)
+        metadata = {
+            "server": server,
+            "input_len": input_len,
+            "client_concurrency": concurrency,
+            "label": label,
+        }
+        (directory / "config.json").write_text(json.dumps(metadata, indent=2))
+        row = {
+            "trial": tid,
+            **server,
+            "input_len": input_len,
+            "server_max_num_seqs": server["max_num_seqs"],
+            "client_concurrency": concurrency,
+            "label": label,
+            "status": "error",
+        }
+        proc = None
+        with open(directory / "server.log", "w", encoding="utf-8") as server_log, \
+             open(directory / "benchmark.log", "w", encoding="utf-8") as benchmark_log:
             try:
-                cmd=make_server_cmd(self.c,s);(d/"server_command.txt").write_text(" ".join(cmd))
-                proc=subprocess.Popen(cmd,stdout=sl,stderr=subprocess.STDOUT,env=shell_env(self.c),start_new_session=True)
-                ok,msg=wait_health(f"http://{self.c.get('host','127.0.0.1')}:{self.c.get('port',8000)}/v1/models",proc,self.c.get("startup_timeout_sec",900))
-                if not ok:raise RuntimeError(msg)
-                b=self.c["benchmark"]; result=d/"benchmark.json"
-                bench=["vllm","bench","serve","--backend",b.get("backend","openai-chat"),
-                  "--host",self.c.get("host","127.0.0.1"),"--port",str(self.c.get("port",8000)),
-                  "--endpoint","/v1/chat/completions","--model",self.c["model"],
-                  "--served-model-name",self.c.get("served_model_name","model"),
-                  "--dataset-name",b.get("dataset_name","random"),"--random-input-len",str(input_len),
-                  "--random-output-len",str(b["output_len"]),"--num-prompts",str(b["num_prompts"]),
-                  "--max-concurrency",str(conc),"--save-result","--result-filename",str(result)]
-                bench += [str(x) for x in b.get("extra_args",[])]
-                rc=subprocess.run(bench,stdout=bl,stderr=subprocess.STDOUT,env=shell_env(self.c)).returncode
-                row.update(parse_metrics(result));row["status"]="ok" if rc==0 else f"bench_exit_{rc}"
-                if rc:row["error"]=f"benchmark exited {rc}"
-                if row.get("failed",0) not in (0,None):row["status"]="request_failures"
-            except Exception as e:row["error"]=str(e);print(f"[{tid}] ERROR: {e}",file=sys.stderr)
-            finally:stop_process(proc,self.c.get("shutdown_timeout_sec",30))
-        self.rows.append(row);self.write_summary()
-        print(f"[{self.idx}] {tid}: {row['status']} input={input_len} concurrency={conc}")
+                cmd = make_server_cmd(self.c, server)
+                (directory / "server_command.txt").write_text(" ".join(cmd))
+                proc = subprocess.Popen(
+                    cmd, stdout=server_log, stderr=subprocess.STDOUT,
+                    env=shell_env(self.c), start_new_session=True,
+                )
+                url = (
+                    f"http://{self.c.get('host', '127.0.0.1')}:"
+                    f"{self.c.get('port', 8000)}/v1/models"
+                )
+                ok, message = wait_health(
+                    url, proc, self.c.get("startup_timeout_sec", 900)
+                )
+                if not ok:
+                    raise RuntimeError(message)
+
+                benchmark = self.c["benchmark"]
+                result = directory / "benchmark.json"
+                bench_cmd = [
+                    "vllm", "bench", "serve",
+                    "--backend", benchmark.get("backend", "openai-chat"),
+                    "--host", self.c.get("host", "127.0.0.1"),
+                    "--port", str(self.c.get("port", 8000)),
+                    "--endpoint", "/v1/chat/completions",
+                    "--model", self.c["model"],
+                    "--served-model-name", self.c.get("served_model_name", "model"),
+                    "--dataset-name", benchmark.get("dataset_name", "random"),
+                    "--random-input-len", str(input_len),
+                    "--random-output-len", str(benchmark["output_len"]),
+                    "--num-prompts", str(benchmark["num_prompts"]),
+                    "--max-concurrency", str(concurrency),
+                    "--save-result", "--result-filename", str(result),
+                ]
+                bench_cmd += [str(x) for x in benchmark.get("extra_args", [])]
+                completed = subprocess.run(
+                    bench_cmd, stdout=benchmark_log, stderr=subprocess.STDOUT,
+                    env=shell_env(self.c),
+                )
+                row.update(parse_metrics(result))
+                row["status"] = "ok" if completed.returncode == 0 else f"bench_exit_{completed.returncode}"
+                if completed.returncode:
+                    row["error"] = f"benchmark exited {completed.returncode}"
+                if row.get("failed", 0) not in (0, None):
+                    row["status"] = "request_failures"
+            except Exception as error:
+                row["error"] = str(error)
+                print(f"[{tid}] ERROR: {error}", file=sys.stderr)
+            finally:
+                stop_process(proc, self.c.get("shutdown_timeout_sec", 30))
+        self.rows.append(row)
+        self.write_summary()
+        print(
+            f"[{self.idx}] {tid}: {row['status']} "
+            f"input={input_len} client_concurrency={concurrency} "
+            f"server_max_num_seqs={server['max_num_seqs']}"
+        )
         return row
+
     def write_summary(self):
         if self.rows:
-            with open(self.base/"summary.csv","w",newline="",encoding="utf-8") as f:
-                w=csv.DictWriter(f,fieldnames=sorted({k for r in self.rows for k in r}));w.writeheader();w.writerows(self.rows)
+            with open(self.base / "summary.csv", "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=sorted({key for row in self.rows for key in row})
+                )
+                writer.writeheader()
+                writer.writerows(self.rows)
 
-def satisfies(row,limits):
-    if row.get("status")!="ok":return False
-    checks=[("min_output_throughput","output_throughput",lambda x,y:x>=y),
-            ("max_mean_ttft_ms","mean_ttft_ms",lambda x,y:x<=y),
-            ("max_mean_tpot_ms","mean_tpot_ms",lambda x,y:x<=y)]
-    for limit,key,fn in checks:
-        bound=limits.get(limit)
+
+def satisfies(row, limits):
+    if row.get("status") != "ok":
+        return False
+    checks = [
+        ("min_output_throughput", "output_throughput", lambda x, y: x >= y),
+        ("max_mean_ttft_ms", "mean_ttft_ms", lambda x, y: x <= y),
+        ("max_mean_tpot_ms", "mean_tpot_ms", lambda x, y: x <= y),
+    ]
+    for limit_name, metric_name, compare in checks:
+        bound = limits.get(limit_name)
         if bound is not None:
-            value=row.get(key)
-            if value is None or not fn(float(value),float(bound)):return False
+            value = row.get(metric_name)
+            if value is None:
+                return False
+            try:
+                if not compare(float(value), float(bound)):
+                    return False
+            except (TypeError, ValueError):
+                return False
     return True
-def score(row,objective):
-    key={"throughput":"output_throughput","request_throughput":"request_throughput","latency":"mean_tpot_ms"}.get(objective,"output_throughput")
-    v=row.get(key)
-    if v is None:return None
-    return -float(v) if objective=="latency" else float(v)
 
-def adaptive(c,runner):
-    a=c.get("auto_tune",{}); lim=a.get("limits",{})
-    # Defaults intentionally permissive: throughput has no minimum; latency caps are broad.
-    limits={"min_output_throughput":0,"max_mean_ttft_ms":10000,"max_mean_tpot_ms":1000,**lim}
-    objective=a.get("objective","throughput")
-    out_len=int(c["benchmark"].get("output_len",128))
-    # Search starts from the lowest configured value for each dimension.
-    space=a.get("search_space",{})
-    defaults={"context_lengths":[4096,8192,16384,32768,65536,131072,262144],
-      "max_num_seqs":[1,2,4,8,16,32],"max_num_batched_tokens":[1024,2048,4096,8192,16384],
-      "gpu_memory_utilization":[0.80,0.85,0.90,0.93]}
-    for k,v in defaults.items():space.setdefault(k,v)
-    dims=["context_lengths","max_num_seqs","max_num_batched_tokens","gpu_memory_utilization"]
-    for k in dims:
-        space[k]=sorted(set(space[k]))
-        if not space[k]:raise ValueError(f"search_space.{k} cannot be empty")
-    tp=int(a.get("tensor_parallel_size",c.get("server",{}).get("tensor_parallel_size",[1])[0]))
-    chunk=bool(a.get("enable_chunked_prefill",True))
-    concs=sorted(set(int(x) for x in a.get("benchmark_concurrency",[1,2,4,8])))
-    # Coordinate ascent: test one-step neighbors from the minimum feasible point, move only on score improvement.
-    idx={k:0 for k in dims}; seen={}; max_trials=int(a.get("max_trials",40)); rounds=0
+
+def rank_key(row, objective):
+    """Higher tuple is better; concurrency is deliberately part of capacity ranking."""
+    throughput = float(row.get("output_throughput", 0) or 0)
+    req_rate = float(row.get("request_throughput", 0) or 0)
+    tpot = row.get("mean_tpot_ms")
+    if objective == "latency":
+        return (-(float(tpot) if tpot is not None else float("inf")), throughput)
+    if objective == "request_throughput":
+        return (req_rate, throughput)
+    if objective == "max_capacity":
+        return (int(row.get("client_concurrency", 0)), throughput)
+    return (throughput, req_rate)
+
+
+def adaptive(config, runner):
+    auto = config.get("auto_tune", {})
+    limits = {
+        "min_output_throughput": 0,
+        "max_mean_ttft_ms": 10000,
+        "max_mean_tpot_ms": 1000,
+        **auto.get("limits", {}),
+    }
+    objective = auto.get("objective", "throughput")
+    if objective not in {"throughput", "request_throughput", "latency", "max_capacity"}:
+        raise ValueError("objective must be throughput, request_throughput, latency, or max_capacity")
+
+    output_len = int(config["benchmark"].get("output_len", 128))
+    space = auto.get("search_space", {})
+    defaults = {
+        "context_lengths": [4096, 8192, 16384, 32768, 65536, 131072, 262144],
+        "max_num_seqs": [1, 2, 4, 8, 16, 32],
+        "max_num_batched_tokens": [1024, 2048, 4096, 8192, 16384],
+        "gpu_memory_utilization": [0.80, 0.85, 0.90, 0.93],
+    }
+    for key, values in defaults.items():
+        space.setdefault(key, values)
+    dims = list(defaults)
+    for key in dims:
+        space[key] = sorted(set(space[key]))
+        if not space[key]:
+            raise ValueError(f"search_space.{key} cannot be empty")
+
+    tp = int(auto.get("tensor_parallel_size", config.get("server", {}).get("tensor_parallel_size", [1])[0]))
+    chunked = bool(auto.get("enable_chunked_prefill", True))
+    concurrencies = sorted(set(int(x) for x in auto.get("benchmark_concurrency", [1, 2, 4, 8])))
+    if not concurrencies or any(x < 1 for x in concurrencies):
+        raise ValueError("benchmark_concurrency must contain positive integers")
+
+    max_trials = int(auto.get("max_trials", 40))
+    max_rounds = int(auto.get("max_rounds", 12))
+    repeats = int(auto.get("final_validation_repeats", 3))
+    if max_trials < 1 or max_rounds < 0 or repeats < 1:
+        raise ValueError("max_trials/final_validation_repeats must be >=1 and max_rounds >=0")
+
+    # Client concurrency is intentionally independent of server max_num_seqs.
+    # Requests above max_num_seqs queue; this is a valid overload/queueing test.
+    position = {key: 0 for key in dims}
+    evaluated = {}
+    configs = {}
+    rounds = 0
+
     def evaluate(pos):
-        key=tuple(pos[k] for k in dims)
-        if key in seen:return seen[key]
-        if len(seen)>=max_trials:return None
-        context=space["context_lengths"][pos["context_lengths"]]
-        seqs=space["max_num_seqs"][pos["max_num_seqs"]]
-        tokens=space["max_num_batched_tokens"][pos["max_num_batched_tokens"]]
-        mem=space["gpu_memory_utilization"][pos["gpu_memory_utilization"]]
-        s={"tensor_parallel_size":tp,"max_model_len":int(context)+out_len,"max_num_seqs":int(seqs),
-           "max_num_batched_tokens":int(tokens),"gpu_memory_utilization":float(mem),"enable_chunked_prefill":chunk}
-        # Probe at concurrency 1 for stable constraint measurements; then configured levels.
-        rows=[runner.trial(s,int(context),conc,"adaptive_coordinate_search") for conc in concs]
-        valid=[r for r in rows if satisfies(r,limits)]
-        scored=[(score(r,objective),r) for r in valid]
-        scored=[x for x in scored if x[0] is not None]
-        result=max(scored,key=lambda x:x[0]) if scored else (None,rows[0] if rows else None)
-        seen[key]=result
+        key = tuple(pos[name] for name in dims)
+        if key in evaluated:
+            return evaluated[key]
+        if len(evaluated) >= max_trials:
+            return None
+        context = int(space["context_lengths"][pos["context_lengths"]])
+        seqs = int(space["max_num_seqs"][pos["max_num_seqs"]])
+        batched_tokens = int(space["max_num_batched_tokens"][pos["max_num_batched_tokens"]])
+        memory = float(space["gpu_memory_utilization"][pos["gpu_memory_utilization"]])
+        server = {
+            "tensor_parallel_size": tp,
+            "max_model_len": context + output_len,
+            "max_num_seqs": seqs,
+            "max_num_batched_tokens": batched_tokens,
+            "gpu_memory_utilization": memory,
+            "enable_chunked_prefill": chunked,
+        }
+        configs[key] = server
+        rows = []
+        for concurrency in concurrencies:
+            rows.append(runner.trial(server, context, concurrency, "adaptive_search"))
+        feasible = [row for row in rows if satisfies(row, limits)]
+        best_row = max(feasible, key=lambda row: rank_key(row, objective)) if feasible else None
+        result = (rank_key(best_row, objective), best_row) if best_row else (None, None)
+        evaluated[key] = result
         return result
-    current=evaluate(idx)
-    if current is None or current[0] is None:
-        raise RuntimeError("Lowest candidate did not satisfy constraints or produced no parseable objective metric. Check logs/limits.")
-    improved=True
-    while improved and len(seen)<max_trials:
-        improved=False; rounds+=1
-        for dim in dims:
-            for delta in (-1,1):
-                nxt=idx.copy();nxt[dim]+=delta
-                if not 0<=nxt[dim]<len(space[dim]):continue
-                candidate=evaluate(nxt)
-                if candidate and candidate[0] is not None and candidate[0]>current[0]:
-                    idx,current=nxt,candidate;improved=True
-        if rounds>=int(a.get("max_rounds",12)):break
-    best_context=space["context_lengths"][idx["context_lengths"]]
-    best_seq=space["max_num_seqs"][idx["max_num_seqs"]]
-    best_tokens=space["max_num_batched_tokens"][idx["max_num_batched_tokens"]]
-    best_mem=space["gpu_memory_utilization"][idx["gpu_memory_utilization"]]
-    best={"tensor_parallel_size":tp,"max_model_len":int(best_context)+out_len,"max_num_seqs":int(best_seq),
-          "max_num_batched_tokens":int(best_tokens),"gpu_memory_utilization":float(best_mem),"enable_chunked_prefill":chunk}
-    chosen_row=current[1]
-    rec={"objective":objective,"limits":limits,"recommended_server":best,
-         "benchmark_concurrency":chosen_row.get("client_concurrency"),
-         "selected_metrics":{k:chosen_row.get(k) for k in ("output_throughput","request_throughput","mean_ttft_ms","mean_tpot_ms")},
-         "trials_evaluated":len(runner.rows),"search_method":"discrete coordinate hill-climb from minimum candidate values",
-         "note":"Recommendation is local to configured discrete candidates and this benchmark workload."}
-    (runner.base/"recommendation.json").write_text(json.dumps(rec,indent=2))
-    print("Recommendation saved:",runner.base/"recommendation.json")
-    return best
 
-def launch_best(c,s,base):
-    log=open(base/"final_server.log","w",encoding="utf-8")
-    cmd=make_server_cmd(c,s)
-    proc=subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT,env=shell_env(c),start_new_session=True)
-    ok,msg=wait_health(f"http://{c.get('host','127.0.0.1')}:{c.get('port',8000)}/v1/models",proc,c.get("startup_timeout_sec",900))
+    current = evaluate(position)
+    if current is None or current[1] is None:
+        raise RuntimeError("Initial candidate has no feasible, parseable benchmark result; inspect runs/*/trial_*/ logs.")
+    improved = True
+    while improved and len(evaluated) < max_trials and rounds < max_rounds:
+        improved = False
+        rounds += 1
+        for dimension in dims:
+            for delta in (-1, 1):
+                neighbor = position.copy()
+                neighbor[dimension] += delta
+                if not 0 <= neighbor[dimension] < len(space[dimension]):
+                    continue
+                candidate = evaluate(neighbor)
+                if candidate and candidate[1] is not None and candidate[0] > current[0]:
+                    position, current = neighbor, candidate
+                    improved = True
+
+    # Rank every feasible point seen, then re-run the best candidate at the same
+    # client load. If validation fails, fall through to the next candidate.
+    ranked = []
+    for key, (value, row) in evaluated.items():
+        if row is not None:
+            ranked.append((value, key, row))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    selected = None
+    validation_rows = []
+    for _, key, search_row in ranked:
+        server = configs[key]
+        load = int(search_row["client_concurrency"])
+        trials = [
+            runner.trial(server, int(search_row["input_len"]), load, f"final_validation_{i + 1}")
+            for i in range(repeats)
+        ]
+        validation_rows.extend(trials)
+        valid = [row for row in trials if satisfies(row, limits)]
+        if len(valid) == repeats:
+            selected = (server, max(valid, key=lambda row: rank_key(row, objective)), key)
+            break
+
+    if selected is None:
+        raise RuntimeError(
+            "No candidate passed every final validation repeat. "
+            "No recommended service will be launched; inspect logs or relax noisy SLO limits."
+        )
+
+    best_server, chosen_row, selected_key = selected
+    recommendation = {
+        "objective": objective,
+        "limits": limits,
+        "recommended_server": best_server,
+        "benchmark_concurrency": chosen_row["client_concurrency"],
+        "server_max_num_seqs": best_server["max_num_seqs"],
+        "selected_metrics": {
+            key: chosen_row.get(key)
+            for key in ("output_throughput", "request_throughput", "mean_ttft_ms", "mean_tpot_ms")
+        },
+        "search_configs_evaluated": len(evaluated),
+        "benchmarks_executed": len(runner.rows),
+        "final_validation_repeats": repeats,
+        "final_validation_passed": True,
+        "search_method": "discrete coordinate hill-climb from minimum candidate values",
+        "note": (
+            "Client concurrency may exceed server max_num_seqs; excess requests queue. "
+            "Recommendation is local to the configured discrete candidates and benchmark workload."
+        ),
+    }
+    (runner.base / "recommendation.json").write_text(json.dumps(recommendation, indent=2))
+    print("Recommendation saved:", runner.base / "recommendation.json")
+    return best_server
+
+
+def launch_best(config, server, base):
+    log = open(base / "final_server.log", "w", encoding="utf-8")
+    cmd = make_server_cmd(config, server)
+    proc = subprocess.Popen(
+        cmd, stdout=log, stderr=subprocess.STDOUT,
+        env=shell_env(config), start_new_session=True,
+    )
+    url = (
+        f"http://{config.get('host', '127.0.0.1')}:"
+        f"{config.get('port', 8000)}/v1/models"
+    )
+    ok, message = wait_health(url, proc, config.get("startup_timeout_sec", 900))
     if not ok:
-        stop_process(proc,c.get("shutdown_timeout_sec",30));log.close()
-        raise RuntimeError(f"best-config service failed to start: {msg}; see final_server.log")
-    (base/"final_server.json").write_text(json.dumps({"pid":proc.pid,"command":cmd,"server":s},indent=2))
-    # Deliberately leave the final server running; detach the log descriptor from Python.
+        stop_process(proc, config.get("shutdown_timeout_sec", 30))
+        log.close()
+        raise RuntimeError(f"best-config service failed to start: {message}; see final_server.log")
+    (base / "final_server.json").write_text(
+        json.dumps({"pid": proc.pid, "command": cmd, "server": server}, indent=2)
+    )
     log.close()
-    print(f"Best config service is running (pid={proc.pid}) on port {c.get('port',8000)}")
+    print(f"Best config service is running (pid={proc.pid}) on port {config.get('port', 8000)}")
+
 
 def main():
-    ap=argparse.ArgumentParser(description="Adaptive/grid vLLM serving tuner")
-    ap.add_argument("--config",default="config.json");ap.add_argument("--mode",choices=["grid","adaptive"])
-    ap.add_argument("--dry-run",action="store_true");ap.add_argument("--no-launch-best",action="store_true")
-    args=ap.parse_args();c=read_json(args.config);mode=args.mode or c.get("mode","adaptive")
-    base=Path("runs")/datetime.now().strftime("%Y%m%d_%H%M%S")
+    parser = argparse.ArgumentParser(description="Adaptive/grid vLLM serving tuner")
+    parser.add_argument("--config", default="config.json")
+    parser.add_argument("--mode", choices=["grid", "adaptive"])
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-launch-best", action="store_true")
+    args = parser.parse_args()
+    config = read_json(args.config)
+    mode = args.mode or config.get("mode", "adaptive")
+    base = Path("runs") / datetime.now().strftime("%Y%m%d_%H%M%S")
     if args.dry_run:
         print(f"mode={mode}; config={args.config}")
-        if mode=="adaptive":print(json.dumps(c.get("auto_tune",{}),indent=2))
+        if mode == "adaptive":
+            print(json.dumps(config.get("auto_tune", {}), indent=2))
         else:
-            for s in combinations(c["server"]):print("SERVER:"," ".join(make_server_cmd(c,s)))
+            for server in combinations(config["server"]):
+                print("SERVER:", " ".join(make_server_cmd(config, server)))
         return
-    base.mkdir(parents=True,exist_ok=True);runner=Runner(c,base)
-    if mode=="adaptive":
-        best=adaptive(c,runner)
-        if c.get("launch_best",True) and not args.no_launch_best:launch_best(c,best,base)
+    base.mkdir(parents=True, exist_ok=True)
+    runner = Runner(config, base)
+    if mode == "adaptive":
+        best = adaptive(config, runner)
+        if config.get("launch_best", True) and not args.no_launch_best:
+            launch_best(config, best, base)
+    elif mode == "grid":
+        for server in combinations(config["server"]):
+            for input_len, concurrency in itertools.product(
+                config["benchmark"]["input_lengths"],
+                config["benchmark"]["max_concurrency"],
+            ):
+                runner.trial(server, int(input_len), int(concurrency), "grid")
     else:
-        for s in combinations(c["server"]):
-            for n,conc in itertools.product(c["benchmark"]["input_lengths"],c["benchmark"]["max_concurrency"]):
-                runner.trial(s,int(n),int(conc),"grid")
+        raise ValueError(f"unsupported mode: {mode}")
     print(f"Done. Results: {base.resolve()}")
-if __name__=="__main__":main()
+
+
+if __name__ == "__main__":
+    main()
