@@ -129,7 +129,7 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 | `max_num_seqs` | `auto_tune.search_space` | `[1, 2, 4, 8, 16, 32]` | 服务端可调度的序列数上限候选。 | 从 `[1, 2, 4]` 起步；吞吐仍随并发提升且延迟、内存满足限制时，再扩展到 8、16、32。它不是客户端并发。 |
 | `max_num_batched_tokens` | `auto_tune.search_space` | `[1024, 2048, 4096, 8192, 16384]` | 单次调度迭代可处理的 token 上限候选。 | 建议先用 `[1024, 2048, 4096]`；Prefill 吞吐受限时逐步提高，若启动失败、内存压力增大或延迟恶化则回退。 |
 | `gpu_memory_utilization` | `auto_tune.search_space` | `[0.80, 0.85, 0.90, 0.93]` | vLLM 设备内存利用率候选。 | 从 `0.80` 或 `0.85` 开始；稳定后再尝试更高值。不要直接设到 1.0；确认当前 vLLM-Ascend 版本支持该参数。 |
-| `fixed_concurrency` | `auto_tune` | `[1, 2, 4, 8]` | 客户端压测并发请求数候选，用于模拟负载；不等于服务端 `max_num_seqs`。 | 默认固定为 `1`，整个搜索和最终复测均使用该值；如需模拟固定负载，可手动设置为 2、4 等，但脚本不会遍历它。 |
+| `fixed_concurrency` | `benchmark` | `1` | 固定压测并发，只作为测量条件，不参与服务端参数搜索。 | 默认固定为 `1`，整个搜索和最终复测均使用该值；如需模拟固定负载，可手动设置为 2、4 等，但脚本不会遍历它。 |
 | `objective` | `auto_tune` | `"throughput"` | 优化目标。 | 吞吐优先选 `"throughput"`；请求处理速率选 `"request_throughput"`；生成延迟选 `"latency"`；当前不提供客户端容量搜索目标。 |
 
 ### 性能限制（SLO）
