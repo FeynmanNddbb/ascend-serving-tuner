@@ -240,7 +240,7 @@ def satisfies(row, limits):
 
 
 def rank_key(row, objective):
-    """Higher tuple is better; concurrency is deliberately part of capacity ranking."""
+    """Higher tuple is better for the selected objective."""
     throughput = float(row.get("output_throughput", 0) or 0)
     req_rate = float(row.get("request_throughput", 0) or 0)
     tpot = row.get("mean_tpot_ms")
@@ -353,7 +353,7 @@ def adaptive(config, runner):
     validation_rows = []
     for _, key, search_row in ranked:
         server = configs[key]
-        load = int(search_row["client_concurrency"])
+        load = fixed_concurrency
         trials = [
             runner.trial(server, int(search_row["input_len"]), load, f"final_validation_{i + 1}")
             for i in range(repeats)
@@ -375,7 +375,7 @@ def adaptive(config, runner):
         "objective": objective,
         "limits": limits,
         "recommended_server": best_server,
-        "benchmark_concurrency": chosen_row["client_concurrency"],
+        "benchmark_fixed_concurrency": fixed_concurrency,
         "server_max_num_seqs": best_server["max_num_seqs"],
         "selected_metrics": {
             key: chosen_row.get(key)
