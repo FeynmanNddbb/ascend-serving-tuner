@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/Status-Experimental-orange" alt="Status">
 </p>
 
-[快速开始](#-快速开始) · [自适应搜索](#-自适应搜索) · [配置示例](#-配置示例) · [结果输出](#-结果输出)
+[快速开始](#-快速开始) · [部署前必改项](DEPLOYMENT.md#1-部署前必须修改的参数) · [全部参数说明](DEPLOYMENT.md#2-全部配置项解释) · [自适应搜索](#-自适应搜索) · [配置示例](#-配置示例) · [结果输出](#-结果与自动启动)
 
 </div>
 
@@ -47,7 +47,7 @@ python3 tuner.py --config config.json --mode adaptive
 python3 tuner.py --config config.json --mode adaptive --no-launch-best
 ```
 
-## 🧠 自适应搜索逻辑
+## 🛠️ 部署参数文档\n\n首次部署建议先阅读 [部署与参数完整说明](DEPLOYMENT.md)：其中列出必须修改的模型路径、设备编号、TP、端口与 CANN 初始化步骤，并逐项解释所有 JSON 参数。\n\n## 🧠 自适应搜索逻辑
 
 1. 将上下文长度、`max_num_seqs`、`max_num_batched_tokens`、`gpu_memory_utilization` 按候选值升序排列。
 2. 从所有维度的最低值组成起点。
