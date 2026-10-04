@@ -116,7 +116,7 @@ class Runner:
         self.rows = []
         self.idx = 0
         self.max_total_benchmarks = int(
-            config.get("auto_tune", {}).get("max_total_benchmarks", 400)
+            config.get("auto_tune", {}).get("max_total_benchmarks", 1200)
         )
 
     def trial(self, server, input_len, concurrency, label=""):
@@ -297,11 +297,12 @@ def adaptive(config, runner):
         raise ValueError("max_trials must be >=0; final_validation_repeats and final_validation_top_k must be >=1")
 
     budget = min(total_candidates, max_trials) if max_trials else total_candidates
-    if budget > runner.max_total_benchmarks:
+    validation_budget = min(validation_top_k, budget) * repeats
+    if budget + validation_budget > runner.max_total_benchmarks:
         raise ValueError(
-            f"Exhaustive search needs {budget} search benchmarks, but "
-            f"max_total_benchmarks={runner.max_total_benchmarks}. Increase "
-            "auto_tune.max_total_benchmarks or explicitly set auto_tune.max_trials "
+            f"Search plus worst-case validation needs {budget + validation_budget} "
+            f"benchmarks, but max_total_benchmarks={runner.max_total_benchmarks}. "
+            "Increase auto_tune.max_total_benchmarks or explicitly set auto_tune.max_trials "
             "to accept a partial search."
         )
 
