@@ -281,9 +281,6 @@ def adaptive(config, runner):
 
     tp = int(auto.get("tensor_parallel_size", config.get("server", {}).get("tensor_parallel_size", [1])[0]))
     chunked = bool(auto.get("enable_chunked_prefill", True))
-    fixed_concurrency = int(config.get("benchmark", {}).get("fixed_concurrency", 1))
-    if fixed_concurrency < 1:
-        raise ValueError("benchmark.fixed_concurrency must be a positive integer")
 
     max_trials = int(auto.get("max_trials", 40))
     max_rounds = int(auto.get("max_rounds", 12))
@@ -291,8 +288,8 @@ def adaptive(config, runner):
     if max_trials < 1 or max_rounds < 0 or repeats < 1:
         raise ValueError("max_trials/final_validation_repeats must be >=1 and max_rounds >=0")
 
-    # Client concurrency is intentionally independent of server max_num_seqs.
-    # Requests above max_num_seqs queue; this is a valid overload/queueing test.
+    # Benchmark concurrency is coupled to the candidate server max_num_seqs.
+    # This tests each server concurrency setting at its configured capacity.
     position = {key: 0 for key in dims}
     evaluated = {}
     configs = {}
@@ -317,13 +314,14 @@ def adaptive(config, runner):
             "enable_chunked_prefill": chunked,
         }
         configs[key] = server
-        rows = [runner.trial(server, context, fixed_concurrency, "adaptive_search_fixed_load")]
+        rows = [runner.trial(server, context, seqs, "adaptive_search_server_concurrency")]
         metric_by_objective = {
             "throughput": "output_throughput",
             "request_throughput": "request_throughput",
             "latency": "mean_tpot_ms",
         }
-        metric = metric_by_objective[objective]\n        feasible = [row for row in rows if satisfies(row, limits) and row.get(metric) is not None]
+        metric = metric_by_objective[objective]
+        feasible = [row for row in rows if satisfies(row, limits) and row.get(metric) is not None]
         best_row = max(feasible, key=lambda row: rank_key(row, objective)) if feasible else None
         result = (rank_key(best_row, objective), best_row) if best_row else (None, None)
         evaluated[key] = result
@@ -358,7 +356,7 @@ def adaptive(config, runner):
     validation_rows = []
     for _, key, search_row in ranked:
         server = configs[key]
-        load = fixed_concurrency
+        load = int(server["max_num_seqs"])
         trials = [
             runner.trial(server, int(search_row["input_len"]), load, f"final_validation_{i + 1}")
             for i in range(repeats)
@@ -380,7 +378,7 @@ def adaptive(config, runner):
         "objective": objective,
         "limits": limits,
         "recommended_server": best_server,
-        "benchmark_fixed_concurrency": fixed_concurrency,
+        "benchmark_concurrency_rule": "equals recommended_server.max_num_seqs",
         "server_max_num_seqs": best_server["max_num_seqs"],
         "selected_metrics": {
             key: chosen_row.get(key)
@@ -392,8 +390,8 @@ def adaptive(config, runner):
         "final_validation_passed": True,
         "search_method": "discrete coordinate hill-climb from minimum candidate values",
         "note": (
-            "Only server configuration is searched. A single fixed benchmark concurrency is used as a measurement condition, not as a search dimension. "
-            "Recommendation is local to the configured discrete candidates and fixed benchmark workload."
+            "For each candidate, client benchmark concurrency equals server max_num_seqs; the client concurrency is derived, not independently searched. "
+            "Recommendation is local to the configured discrete candidates and benchmark workload."
         ),
     }
     (runner.base / "recommendation.json").write_text(json.dumps(recommendation, indent=2))
