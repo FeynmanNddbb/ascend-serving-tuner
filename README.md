@@ -4,7 +4,7 @@
 
 **Adaptive parameter search for vLLM / vLLM-Ascend inference serving**
 
-自动探测长上下文可运行边界，进一步搜索服务端并发与批处理参数；保留传统网格搜索模式。
+从最低候选参数开始，通过离散坐标爬山搜索上下文、服务端并发、批处理 token 和内存利用率；支持吞吐、TTFT、TPOT 约束，并可按推荐参数自动启动服务。
 
 <p>
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python" alt="Python">
@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/Status-Experimental-orange" alt="Status">
 </p>
 
-[快速开始](#-快速开始) · [自适应模式](#-自适应模式) · [配置示例](#-配置示例) · [结果输出](#-结果输出)
+[快速开始](#-快速开始) · [自适应搜索](#-自适应搜索) · [配置示例](#-配置示例) · [结果输出](#-结果输出)
 
 </div>
 
@@ -22,40 +22,15 @@
 
 ## 🎯 项目简介
 
-服务端参数存在明显耦合：上下文长度影响 KV Cache 占用，并发与批处理 token 上限影响调度、吞吐和延迟。盲目枚举所有组合既耗时，也容易反复触发启动失败或 OOM。
+Serving 参数相互耦合：上下文长度影响 KV Cache 占用，并发与批处理 token 上限影响吞吐和延迟。固定网格搜索容易产生大量无效实验。
 
-**Ascend Serving Tuner** 提供两种运行模式：
+本项目提供：
+- **从低到高探索：** 各参数从候选列表最低值开始。
+- **约束筛选：** 可设置最低输出吞吐、最大 TTFT、最大 TPOT。
+- **梯度式离散调整：** 使用坐标爬山，每轮只尝试当前点相邻候选，指标改善且满足约束时才移动。
+- **自动启动最终服务：** 搜索完成后按推荐参数重新启动服务并等待健康检查。
 
-| 模式 | 适用场景 |
-|---|---|
-| `adaptive` | 先探索最大可运行输入长度，再在该长度上比较并发与批处理配置 |
-| `grid` | 对用户明确指定的参数组合做系统性对照实验 |
-
-## ✨ 功能
-
-- 自适应上下文探测：按倍增候选建立搜索区间，再二分定位最大成功档位
-- 服务端参数调优：`max-num-seqs`、`max-num-batched-tokens`、TP、显存利用率、Chunked Prefill
-- 自动启动服务、健康检查、运行 `vllm bench serve` 并停止本工具启动的进程
-- 记录每次实验的配置、启动命令、服务日志、压测日志、JSON 与 CSV
-- 输出 `recommendation.json`，记录最大成功输入长度及可解析吞吐指标下的推荐配置
-
-> 当前是实验型 MVP。成功标准是服务健康检查与 benchmark 返回成功；它不等同于经过多轮稳定性验证的生产容量。设备内存探测、OOM 自动恢复、不同芯片参数能力识别及 profiler 集成仍在演进中。
-
-## 🧭 工作流程
-
-```mermaid
-flowchart TD
-  A[读取配置] --> B{运行模式}
-  B -->|adaptive| C[构造上下文候选阶梯]
-  C --> D[低负载探测 / 二分定位]
-  D --> E[固定最大成功输入长度]
-  E --> F[搜索 max_num_seqs 与 batched tokens]
-  F --> G[按吞吐指标选择候选]
-  B -->|grid| H[遍历指定参数组合]
-  H --> I[逐组启动与压测]
-  G --> J[保存推荐配置 / CSV / 日志]
-  I --> J
-```
+> 这是离散启发式搜索，不是对连续参数求导的数学梯度，也不保证全局最优。推荐结果只对给定候选空间、模型、硬件和压测负载有效。
 
 ## 🚀 快速开始
 
@@ -63,39 +38,26 @@ flowchart TD
 git clone https://github.com/FeynmanNddbb/ascend-serving-tuner.git
 cd ascend-serving-tuner
 cp config.example.json config.json
-
-# 先在当前 shell 初始化对应软件栈
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
-# 只检查运行模式和候选，不启动服务
 python3 tuner.py --config config.json --mode adaptive --dry-run
-
-# 自适应搜索
 python3 tuner.py --config config.json --mode adaptive
+
+# 只搜索，不启动最终服务
+python3 tuner.py --config config.json --mode adaptive --no-launch-best
 ```
 
-传统网格搜索：
+## 🧠 自适应搜索逻辑
 
-```bash
-python3 tuner.py --config config.json --mode grid
-```
+1. 将上下文长度、`max_num_seqs`、`max_num_batched_tokens`、`gpu_memory_utilization` 按候选值升序排列。
+2. 从所有维度的最低值组成起点。
+3. 测试当前点相邻的参数候选；服务启动或 benchmark 失败、约束不满足的候选不会成为推荐项。
+4. 对满足约束的候选按目标指标评分，找到更优邻居后移动，直到没有改进、达到轮数或试验预算。
+5. 保存推荐配置，并默认按该配置启动最终服务。
 
-请先用空闲端口与专用实验机器；不要在生产服务端口上运行。
-
-## 🧠 自适应模式
-
-默认策略：
-
-1. 从 `start_context` 开始构造倍增阶梯，直到 `max_context`。
-2. 以低并发基线启动模型并压测，使用二分方式寻找最大成功输入长度档位。
-3. 固定已验证的输入长度，遍历指定的 `tune_max_num_seqs` 与 `tune_max_num_batched_tokens`。
-4. 对每组运行指定客户端并发，优先按可解析的 output token throughput 选择推荐项；若该指标不可解析，则只输出最大成功上下文，不伪造吞吐最优值。
-
-注意：这里的“最大上下文”是**本次配置和压测条件下最大成功的输入长度档位**，不是硬件理论极限。二分搜索假设成功性大致随上下文长度单调变化；遇到碎片、运行波动或非单调行为时，应使用 grid 复核。输出长度会加到 `max_model_len` 上限中。
+当前实现采用**离散坐标爬山**，避免一次性穷举笛卡尔积；可能陷入局部最优。重要部署建议在推荐点附近做网格复测。
 
 ## ⚙️ 配置示例
-
-示例以双卡 Ascend、Qwen3.8-27B-W8A8 本地模型为例：
 
 ```json
 {
@@ -105,23 +67,26 @@ python3 tuner.py --config config.json --mode grid
   "host": "127.0.0.1",
   "port": 8000,
   "visible_devices": "0,1",
-  "startup_timeout_sec": 900,
-  "shutdown_timeout_sec": 30,
-
+  "launch_best": true,
   "auto_tune": {
-    "start_context": 4096,
-    "max_context": 262144,
+    "objective": "throughput",
     "tensor_parallel_size": 2,
-    "probe_max_num_seqs": 1,
-    "probe_max_num_batched_tokens": 2048,
-    "gpu_memory_utilization": 0.9,
     "enable_chunked_prefill": true,
-    "probe_concurrency": 1,
-    "tune_max_num_seqs": [1, 2, 4, 8, 16, 32],
-    "tune_max_num_batched_tokens": [2048, 4096, 8192, 16384],
-    "benchmark_concurrency": [1, 2, 4, 8]
+    "search_space": {
+      "context_lengths": [4096, 8192, 16384, 32768, 65536, 131072, 262144],
+      "max_num_seqs": [1, 2, 4, 8, 16, 32],
+      "max_num_batched_tokens": [1024, 2048, 4096, 8192, 16384],
+      "gpu_memory_utilization": [0.80, 0.85, 0.90, 0.93]
+    },
+    "benchmark_concurrency": [1, 2, 4, 8],
+    "max_trials": 40,
+    "max_rounds": 12,
+    "limits": {
+      "min_output_throughput": 0,
+      "max_mean_ttft_ms": 10000,
+      "max_mean_tpot_ms": 1000
+    }
   },
-
   "benchmark": {
     "output_len": 128,
     "num_prompts": 16,
@@ -132,53 +97,38 @@ python3 tuner.py --config config.json --mode grid
 }
 ```
 
-| 参数 | 含义 |
-|---|---|
-| `start_context` / `max_context` | 输入长度探测下界与上界 |
-| `probe_max_num_seqs` | 找上下文边界时采用的服务端序列上限 |
-| `probe_max_num_batched_tokens` | 边界探测阶段的批处理 token 上限 |
-| `tune_max_num_seqs` | 在最大成功输入长度下尝试的服务端序列上限 |
-| `tune_max_num_batched_tokens` | 联合测试的批处理 token 候选 |
-| `benchmark_concurrency` | 客户端压测并发；不等于服务端 `max_num_seqs` |
+### 约束与默认值
 
-## 📊 结果输出
+| 配置 | 默认值 | 含义 |
+|---|---:|---|
+| `min_output_throughput` | 0 tokens/s | 不设吞吐下限 |
+| `max_mean_ttft_ms` | 10000 ms | 宽松首 token 延迟上限 |
+| `max_mean_tpot_ms` | 1000 ms | 宽松单 token 延迟上限 |
 
-```text
-runs/<timestamp>/
-├── summary.csv
-├── recommendation.json
-├── trial_0001/
-│   ├── config.json
-│   ├── server_command.txt
-│   ├── server.log
-│   ├── benchmark.log
-│   └── benchmark.json
-└── ...
-```
+默认值是起步保护值，不代表业务 SLA。可按业务收紧，例如 TTFT 2000ms、TPOT 80ms。若约束启用但指标未能从当前版本结果 JSON 解析，该候选不会被判定为满足约束。
 
-- `summary.csv`：每次实验的参数、状态和可识别指标。
-- `recommendation.json`：最大成功输入长度及可解析吞吐下的推荐参数。
-- 每个 `trial_xxxx`：保留原始日志，便于排查启动失败、请求失败与版本兼容问题。
+目标支持 `throughput`（默认最大化输出 token 吞吐）、`request_throughput` 和 `latency`（最小化 TPOT）。
 
-## ⚠️ 重要边界
+## 📊 结果与自动启动
 
-- 运行前请在当前 Shell 中 source 对应 CANN 环境；配置里的 `cann_env` 字段目前仅作路径提示，脚本不会自动 source。
-- vLLM CLI 和 `vllm bench serve` 参数会随版本变化。请用本机 `vllm serve --help`、`vllm bench serve --help` 核对。
-- 本工具只停止自己启动的服务进程，但仍建议使用专用空闲端口。
-- 不自动安装驱动/CANN、不下载模型，也不承诺所有硬件后端均已适配。
-- 结果是实验测量，不是生产 SLA；建议对推荐配置做多轮、不同请求分布的复测。
+`runs/<timestamp>/` 包含 `summary.csv`、`recommendation.json`、每次试验日志，以及最终服务的 `final_server.json` 和 `final_server.log`。默认 `launch_best: true`；不想启动时设置 false 或传入 `--no-launch-best`。最终服务会留在后台运行。
+
+## ⚠️ 注意事项
+
+- 运行前在当前 shell 初始化 CANN；`cann_env` 路径字段不代表脚本自动 source。
+- vLLM 与 benchmark 参数随版本变化，请先核对本机 help。
+- 请使用空闲端口和专用实验环境；搜索会反复启停测试服务。
+- 搜索是离散局部优化，不保证全局最优；建议对推荐点做多轮复测。
+- 当前未实现硬件内存自动探测、OOM 专项分类回退及多目标 Pareto 最优。
 
 ## 🗺️ Roadmap
 
-- [x] 网格搜索与逐组实验
-- [x] 自适应上下文阶梯探测与二分
-- [x] 上下文边界处并发 / batch token 候选搜索
-- [x] 日志、CSV 与推荐配置落盘
-- [ ] 设备内存自动探测与安全候选生成
-- [ ] OOM 分类与自动回退重试
-- [ ] TTFT / TPOT 约束与多目标 Pareto 筛选
-- [ ] CUDA backend adapter、Ascend Profiler 指标接入
-- [ ] HTML 可视化报告
+- [x] 网格搜索
+- [x] 离散坐标自适应搜索与 SLO 限制
+- [x] 推荐参数自动启动
+- [ ] OOM 分类、自动回退与设备内存探测
+- [ ] TTFT/TPOT 多目标 Pareto 优化
+- [ ] CUDA backend adapter、Ascend Profiler、HTML 报告
 
 ## 📄 License
 
