@@ -121,26 +121,46 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 
 ## 4. 核心调优参数
 
-以下参数名与 `config.json` 中的实际 JSON 键保持一致，按配置层级书写。
+下面直接使用 `config.json` 中的**原始参数名**。表格中的“所在位置”只用于帮助你在 JSON 中找到该字段。
 
-| 配置键 | 作用 | 调整建议 |
-|---|---|---|
-| `auto_tune.search_space.context_lengths` | 输入上下文长度候选（token）；脚本将 `benchmark.output_len` 加到 `max_model_len` | 从小到大设置；先测 4K/8K/16K，再逐步扩大 |
-| `auto_tune.search_space.max_num_seqs` | 服务端同时调度的序列数上限候选 | 从 1、2、4 逐步增加；它不是客户端压测并发数 |
-| `auto_tune.search_space.max_num_batched_tokens` | 单次调度迭代可处理的 token 上限候选 | 小值可能限制 Prefill 吞吐，大值可能增加内存压力 |
-| `auto_tune.search_space.gpu_memory_utilization` | vLLM 设备内存利用率候选 | 从保守值开始；确认当前 vLLM-Ascend 版本支持该参数 |
-| `auto_tune.benchmark_concurrency` | 压测客户端并发请求数候选 | 用来模拟业务负载；不等于服务端 `max_num_seqs` |
-| `auto_tune.objective` | 选择优化目标 | `throughput` 最大化输出 token/s；`request_throughput` 最大化 req/s；`latency` 最小化平均 TPOT |
+| 参数名（按配置原名） | 所在位置 | 示例 | 作用与调整建议 |
+|---|---|---|---|
+| `context_lengths` | `auto_tune.search_space` | `[4096, 8192, 16384, 32768, 65536, 131072]` | 输入上下文长度候选，单位 token。脚本会将 `benchmark.output_len` 加到服务端 `max_model_len`；先从 4K/8K/16K 开始，再逐步扩大。 |
+| `max_num_seqs` | `auto_tune.search_space` | `[1, 2, 4, 8, 16, 32]` | 服务端可调度的序列数上限候选。它不是客户端压测并发数。 |
+| `max_num_batched_tokens` | `auto_tune.search_space` | `[1024, 2048, 4096, 8192, 16384]` | 单次调度迭代可处理的 token 上限候选。较小可能限制 Prefill 吞吐，较大可能增加内存压力。 |
+| `gpu_memory_utilization` | `auto_tune.search_space` | `[0.80, 0.85, 0.90, 0.93]` | vLLM 设备内存利用率候选。从保守值开始，并确认当前 vLLM-Ascend 版本支持。 |
+| `benchmark_concurrency` | `auto_tune` | `[1, 2, 4, 8]` | 客户端压测并发请求数候选，用于模拟负载；不等于 `max_num_seqs`。 |
+| `objective` | `auto_tune` | `"throughput"` | 优化目标：`throughput` 最大化输出 token/s；`request_throughput` 最大化 req/s；`latency` 最小化平均 TPOT。 |
 
 ### 性能限制（SLO）
 
-| 配置键 | 默认值 | 含义 |
-|---|---:|---|
-| `auto_tune.limits.min_output_throughput` | `0` tokens/s | 不设有效吞吐下限，但吞吐指标仍需可解析 |
-| `auto_tune.limits.max_mean_ttft_ms` | `10000` ms | 平均首 token 延迟上限，宽松起步值 |
-| `auto_tune.limits.max_mean_tpot_ms` | `1000` ms | 平均每输出 token 时间上限，宽松起步值 |
+| 参数名（按配置原名） | 所在位置 | 默认示例 | 作用 |
+|---|---|---:|---|
+| `min_output_throughput` | `auto_tune.limits` | `0` | 输出吞吐最低门槛，单位 tokens/s。0 表示不设有效吞吐下限。 |
+| `max_mean_ttft_ms` | `auto_tune.limits` | `10000` | 平均首 token 延迟上限，单位 ms。 |
+| `max_mean_tpot_ms` | `auto_tune.limits` | `1000` | 平均每输出 token 时间上限，单位 ms。 |
 
-默认值是避免过早筛掉候选的起点，不是生产 SLA。可按实际业务收紧，例如 TTFT 2000 ms、TPOT 80 ms。若启用的指标无法从当前版本 benchmark JSON 解析，该候选不会通过约束筛选。
+默认 SLO 是宽松起点，不是生产 SLA。可按业务收紧，例如 TTFT 2000 ms、TPOT 80 ms。若启用的指标无法从当前版本 benchmark JSON 解析，该候选不会通过约束筛选。
+
+### 配置中对应的原样片段
+
+```json
+"auto_tune": {
+  "objective": "throughput",
+  "search_space": {
+    "context_lengths": [4096, 8192, 16384, 32768, 65536, 131072],
+    "max_num_seqs": [1, 2, 4, 8, 16, 32],
+    "max_num_batched_tokens": [1024, 2048, 4096, 8192, 16384],
+    "gpu_memory_utilization": [0.80, 0.85, 0.90, 0.93]
+  },
+  "benchmark_concurrency": [1, 2, 4, 8],
+  "limits": {
+    "min_output_throughput": 0,
+    "max_mean_ttft_ms": 10000,
+    "max_mean_tpot_ms": 1000
+  }
+}
+```
 
 ## 5. 其他参数说明
 
