@@ -355,7 +355,7 @@ License: MIT
 
 调优结束后，打开本次运行目录中的 `recommendation.json`，将 `recommended_server` 的结果填入下面命令。尖括号中的内容均为**占位符**，必须替换为项目实际输出值；不要把尖括号原样复制到 shell。
 
-以下示例启用本项目当前支持并纳入配置的优化项：**Chunked Prefill**，并使用调优得到的 TP、上下文长度、并发、Batch Tokens 和内存利用率。命令与 tuner 的 `make_server_cmd()` 保持一致：
+以下示例启用已确认的通用 vLLM Serving 开关：**Chunked Prefill** 与 **Prefix Caching**，并使用调优得到的 TP、上下文长度、并发、Batch Tokens 和内存利用率。注意：Prefix Caching 尚未纳入 tuner 搜索，推荐指标是在当前 tuner 压测配置下得到的；若实际业务有重复前缀，应使用重复前缀 workload 重新 benchmark。Partial Prefill 与 Long Partial Prefill 暂不放入示例，待确认 vLLM-Ascend 0.23.0 对应 CLI 参数及 A3/Qwen3.8 组合行为后再加。
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -388,4 +388,4 @@ vllm serve /path/to/<MODEL_DIR> \\
 | `<RECOMMENDED_MAX_NUM_BATCHED_TOKENS>` | `recommendation.json` → `recommended_server.max_num_batched_tokens` |
 | `<RECOMMENDED_GPU_MEMORY_UTILIZATION>` | `recommendation.json` → `recommended_server.gpu_memory_utilization` |
 
-> 当前 tuner 实际传入服务启动命令的优化开关是 `--enable-chunked-prefill`。KV Cache dtype、Prefix Caching、Attention Backend、CUDA Graph 或 Speculative Decoding 尚未纳入本项目的搜索与启动配置，因此这里不虚构“自动启用”。若需手动增加这些后端优化，先确认当前 vLLM/vLLM-Ascend 版本支持，并在相同 workload 下重新 benchmark；否则推荐参数的测试条件与实际部署条件不一致。
+> 当前 tuner 搜索与压测命令中仅启用了 `--enable-chunked-prefill`；本节额外加入 `--enable-prefix-caching` 作为部署示例中的已知 vLLM 开关，但它并非 tuner 已验证的最优项。Prefix Caching 只有在请求共享相同前缀时才可能带来 Prefill 收益。Partial Prefill、Long Partial Prefill、KV Cache dtype、Attention Backend、CUDA Graph 和 Speculative Decoding 暂不加入示例，待确认当前 vLLM-Ascend 版本与模型组合支持后再纳入。
