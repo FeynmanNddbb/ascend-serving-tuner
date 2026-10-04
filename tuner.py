@@ -252,6 +252,11 @@ def rank_key(row, objective):
 
 
 def adaptive(config, runner):
+    """Exhaustively evaluate the configured discrete search space.
+
+    This finds the best measured candidate within the finite configured grid,
+    subject to the benchmark budget and workload/SLO constraints.
+    """
     auto = config.get("auto_tune", {})
     limits = {
         "min_output_throughput": 0,
@@ -279,101 +284,93 @@ def adaptive(config, runner):
         if not space[key]:
             raise ValueError(f"search_space.{key} cannot be empty")
 
+    total_candidates = 1
+    for key in dims:
+        total_candidates *= len(space[key])
+
     tp = int(auto.get("tensor_parallel_size", config.get("server", {}).get("tensor_parallel_size", [1])[0]))
     chunked = bool(auto.get("enable_chunked_prefill", True))
-
-    max_trials = int(auto.get("max_trials", 40))
-    max_rounds = int(auto.get("max_rounds", 12))
+    max_trials = int(auto.get("max_trials", 0))  # 0 means exhaustive; positive value is an explicit cap
     repeats = int(auto.get("final_validation_repeats", 3))
-    if max_trials < 1 or max_rounds < 0 or repeats < 1:
-        raise ValueError("max_trials/final_validation_repeats must be >=1 and max_rounds >=0")
+    validation_top_k = int(auto.get("final_validation_top_k", 5))
+    if max_trials < 0 or repeats < 1 or validation_top_k < 1:
+        raise ValueError("max_trials must be >=0; final_validation_repeats and final_validation_top_k must be >=1")
 
-    # Benchmark concurrency is coupled to the candidate server max_num_seqs.
-    # This tests each server concurrency setting at its configured capacity.
-    position = {key: 0 for key in dims}
-    evaluated = {}
-    configs = {}
-    rounds = 0
+    budget = min(total_candidates, max_trials) if max_trials else total_candidates
+    if budget > runner.max_total_benchmarks:
+        raise ValueError(
+            f"Exhaustive search needs {budget} search benchmarks, but "
+            f"max_total_benchmarks={runner.max_total_benchmarks}. Increase "
+            "auto_tune.max_total_benchmarks or explicitly set auto_tune.max_trials "
+            "to accept a partial search."
+        )
 
-    def evaluate(pos):
-        key = tuple(pos[name] for name in dims)
-        if key in evaluated:
-            return evaluated[key]
-        if len(evaluated) >= max_trials:
-            return None
-        context = int(space["context_lengths"][pos["context_lengths"]])
-        seqs = int(space["max_num_seqs"][pos["max_num_seqs"]])
-        batched_tokens = int(space["max_num_batched_tokens"][pos["max_num_batched_tokens"]])
-        memory = float(space["gpu_memory_utilization"][pos["gpu_memory_utilization"]])
+    evaluated = []
+    metric_by_objective = {
+        "throughput": "output_throughput",
+        "request_throughput": "request_throughput",
+        "latency": "mean_tpot_ms",
+    }
+
+    for index, values in enumerate(itertools.product(*(space[key] for key in dims)), start=1):
+        candidate = dict(zip(dims, values))
+        context = int(candidate["context_lengths"])
+        seqs = int(candidate["max_num_seqs"])
         server = {
             "tensor_parallel_size": tp,
             "max_model_len": context + output_len,
             "max_num_seqs": seqs,
-            "max_num_batched_tokens": batched_tokens,
-            "gpu_memory_utilization": memory,
+            "max_num_batched_tokens": int(candidate["max_num_batched_tokens"]),
+            "gpu_memory_utilization": float(candidate["gpu_memory_utilization"]),
             "enable_chunked_prefill": chunked,
         }
-        configs[key] = server
-        rows = [runner.trial(server, context, seqs, "adaptive_search_server_concurrency")]
-        metric_by_objective = {
-            "throughput": "output_throughput",
-            "request_throughput": "request_throughput",
-            "latency": "mean_tpot_ms",
-        }
+        print(f"\n[GRID {index}/{budget}] candidate={candidate}")
+        row = runner.trial(server, context, seqs, "exhaustive_grid_search")
         metric = metric_by_objective[objective]
-        feasible = [row for row in rows if satisfies(row, limits) and row.get(metric) is not None]
-        best_row = max(feasible, key=lambda row: rank_key(row, objective)) if feasible else None
-        result = (rank_key(best_row, objective), best_row) if best_row else (None, None)
-        evaluated[key] = result
-        return result
+        feasible = satisfies(row, limits) and row.get(metric) is not None
+        score = rank_key(row, objective) if feasible else None
+        evaluated.append({"server": server, "row": row, "score": score, "feasible": feasible})
 
-    current = evaluate(position)
-    if current is None or current[1] is None:
-        raise RuntimeError("Initial candidate has no feasible, parseable benchmark result; inspect runs/*/trial_*/ logs.")
-    improved = True
-    while improved and len(evaluated) < max_trials and rounds < max_rounds:
-        improved = False
-        rounds += 1
-        for dimension in dims:
-            for delta in (-1, 1):
-                neighbor = position.copy()
-                neighbor[dimension] += delta
-                if not 0 <= neighbor[dimension] < len(space[dimension]):
-                    continue
-                candidate = evaluate(neighbor)
-                if candidate and candidate[1] is not None and candidate[0] > current[0]:
-                    position, current = neighbor, candidate
-                    improved = True
-
-    # Rank every feasible point seen, then re-run the best candidate at the same
-    # client load. If validation fails, fall through to the next candidate.
-    ranked = []
-    for key, (value, row) in evaluated.items():
-        if row is not None:
-            ranked.append((value, key, row))
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    selected = None
-    validation_rows = []
-    for _, key, search_row in ranked:
-        server = configs[key]
-        load = int(server["max_num_seqs"])
-        trials = [
-            runner.trial(server, int(search_row["input_len"]), load, f"final_validation_{i + 1}")
-            for i in range(repeats)
-        ]
-        validation_rows.extend(trials)
-        valid = [row for row in trials if satisfies(row, limits)]
-        if len(valid) == repeats:
-            selected = (server, max(valid, key=lambda row: rank_key(row, objective)), key)
-            break
-
-    if selected is None:
+    ranked = [item for item in evaluated if item["feasible"]]
+    ranked.sort(key=lambda item: item["score"], reverse=True)
+    if not ranked:
         raise RuntimeError(
-            "No candidate passed every final validation repeat. "
-            "No recommended service will be launched; inspect logs or relax noisy SLO limits."
+            "No candidate passed SLO/metric checks. Inspect runs/*/trial_*/ logs "
+            "or adjust the configured search space and limits."
         )
 
-    best_server, chosen_row, selected_key = selected
+    # Revalidate the top K measured candidates. Select the best mean validation
+    # score among candidates that pass every repeat, rather than accepting the
+    # first candidate merely because it passed.
+    validation_results = []
+    for item in ranked[:validation_top_k]:
+        server = item["server"]
+        context = int(item["row"]["input_len"])
+        load = int(server["max_num_seqs"])
+        trials = [
+            runner.trial(server, context, load, f"final_validation_{i + 1}")
+            for i in range(repeats)
+        ]
+        valid = all(satisfies(row, limits) and row.get(metric_by_objective[objective]) is not None for row in trials)
+        if valid:
+            scores = [rank_key(row, objective) for row in trials]
+            mean_score = tuple(
+                sum(score[i] for score in scores) / len(scores)
+                for i in range(len(scores[0]))
+            )
+            validation_results.append((mean_score, item, trials))
+
+    if not validation_results:
+        raise RuntimeError(
+            "No top candidate passed every final validation repeat. "
+            "Inspect logs or adjust noisy SLO limits."
+        )
+
+    validation_results.sort(key=lambda entry: entry[0], reverse=True)
+    _, selected, validation_rows = validation_results[0]
+    best_server = selected["server"]
+    chosen_row = max(validation_rows, key=lambda row: rank_key(row, objective))
+
     recommendation = {
         "objective": objective,
         "limits": limits,
@@ -385,13 +382,21 @@ def adaptive(config, runner):
             for key in ("output_throughput", "request_throughput", "mean_ttft_ms", "mean_tpot_ms")
         },
         "search_configs_evaluated": len(evaluated),
+        "search_space_total_configs": total_candidates,
+        "search_complete": len(evaluated) == total_candidates,
+        "search_budget": budget,
         "benchmarks_executed": len(runner.rows),
         "final_validation_repeats": repeats,
+        "final_validation_candidates": min(validation_top_k, len(ranked)),
         "final_validation_passed": True,
-        "search_method": "discrete coordinate hill-climb from minimum candidate values",
+        "search_method": "exhaustive discrete grid search",
+        "optimality_scope": (
+            "Best measured feasible candidate within the configured discrete search space and workload; "
+            "not a guarantee of continuous-space or noise-free global optimum."
+        ),
         "note": (
-            "For each candidate, client benchmark concurrency equals server max_num_seqs; the client concurrency is derived, not independently searched. "
-            "Recommendation is local to the configured discrete candidates and benchmark workload."
+            "Client benchmark concurrency equals candidate server max_num_seqs. "
+            "Every configured candidate was tested unless max_trials explicitly capped the search."
         ),
     }
     (runner.base / "recommendation.json").write_text(json.dumps(recommendation, indent=2))
