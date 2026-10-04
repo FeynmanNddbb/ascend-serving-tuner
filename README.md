@@ -373,6 +373,7 @@ vllm serve /path/to/<MODEL_DIR> \\
   --max-num-seqs <RECOMMENDED_MAX_NUM_SEQS> \\
   --max-num-batched-tokens <RECOMMENDED_MAX_NUM_BATCHED_TOKENS> \\
   --gpu-memory-utilization <RECOMMENDED_GPU_MEMORY_UTILIZATION> \\
+  --enable-prefix-caching \\
   --enable-chunked-prefill
 ```
 
