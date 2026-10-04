@@ -26,7 +26,7 @@
 2. 启动一个候选 vLLM / vLLM-Ascend 服务，并等待 `/v1/models` 健康检查。
 3. 调用 `vllm bench serve`，通过 OpenAI-compatible Chat Completions API 发起请求。
 4. 将 benchmark 结果保存为 JSON，解析吞吐、TTFT、TPOT 等指标。
-5. 按 SLO 过滤候选，并依据目标指标进行离散坐标搜索。
+5. 按 SLO 过滤候选，并依据目标指标进行离散网格穷举搜索（可通过预算显式限制为部分搜索）。
 6. 对候选结果重复验证；通过后写出推荐配置，可选择启动推荐服务。
 
 当前 adaptive 模式中，客户端压测并发自动等于当前候选的服务端 `max_num_seqs`。**用户需要手动配置四组服务端候选参数；客户端并发不需要单独配置。**
@@ -61,7 +61,7 @@ benchmark.json + benchmark.log
 解析指标 / 检查 SLO / 记录 summary.csv
     |
     v
-离散坐标搜索 + 最终重复验证
+离散网格搜索 + Top-K 最终重复验证
     |
     v
 recommendation.json
@@ -199,7 +199,7 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 
 ### 候选列表如何组合
 
-四组列表共同定义搜索空间。列表越长，可能探索的参数区域越广，但试验耗时也会增加。当前 adaptive 是离散坐标搜索，并非把所有组合全部跑完；`max_trials`、`max_rounds` 和 `max_total_benchmarks` 会限制实际搜索预算。
+四组列表共同定义搜索空间。列表越长，可能探索的参数区域越广，但试验耗时也会增加。当前 adaptive 默认穷举候选列表的笛卡尔积；`max_trials` 可显式限制为部分搜索，`max_total_benchmarks` 控制搜索与验证总预算。
 
 建议按以下顺序逐步扩展：
 
@@ -234,9 +234,9 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
       "max_num_batched_tokens": [2048, 4096, 8192, 16384],
       "gpu_memory_utilization": [0.85, 0.90, 0.93]
     },
-    "max_trials": 40,
-    "max_total_benchmarks": 400,
-    "max_rounds": 12,
+    "max_trials": 0,
+    "max_total_benchmarks": 1200,
+    "final_validation_top_k": 5,
     "final_validation_repeats": 3,
     "limits": {
       "min_output_throughput": 0,
@@ -307,11 +307,10 @@ vllm bench serve \
 
 ## 搜索策略与边界
 
-- adaptive 模式采用从各维度最低候选起步的**离散坐标爬山**，逐维尝试相邻候选；不是完整笛卡尔积穷举，也不保证全局最优。
-- `max_trials` 限制不同服务端参数点数量。
-- `max_total_benchmarks` 限制搜索和最终验证的 benchmark 总次数。
-- `max_rounds` 限制坐标搜索轮数。
-- `final_validation_repeats` 控制最终候选重复压测次数；候选每次都通过 SLO 才会被推荐。
+- adaptive 模式默认采用**离散网格穷举**，遍历配置候选列表的笛卡尔积；在候选集合内比较实测可行配置，不因局部邻居变差而提前停止。
+- `max_trials: 0` 表示不限制搜索点数、尝试完整候选集合；正整数表示显式截断搜索，结果会标记 `search_complete: false`。
+- `max_total_benchmarks` 限制搜索与最终验证的 benchmark 总次数；预算不足时会在开跑前报错。
+- `final_validation_top_k` 控制复测排名靠前的候选数；`final_validation_repeats` 控制每个候选的重复次数。
 - 当前客户端并发不是独立搜索维度，而是由当前候选 `max_num_seqs` 派生。
 - 当前未实现自动设备内存探测、OOM 专项分类回退或 Pareto 多目标优化。
 - 随机数据适合相对参数比较，不等价于真实业务的输入分布、输出分布或到达过程。
@@ -341,8 +340,8 @@ vllm bench serve \
 **为什么某些候选失败？**  
 可能是模型加载失败、设备内存不足、CLI 参数版本不兼容、服务未通过健康检查、benchmark 非零退出或请求失败。查看对应 `server.log` 与 `benchmark.log`。
 
-**为什么搜索结果不一定是全局最优？**  
-adaptive 使用离散坐标爬山并受 `max_trials`、`max_rounds` 限制。想覆盖更多区域，需手动调整候选列表或增加搜索预算。
+**搜索结果是否是全局最优？**  
+完整搜索时，它是当前离散候选集合、当前 workload、SLO 和硬件软件环境下的最佳实测候选；不代表连续参数空间或其他负载下的数学全局最优。若 `max_trials` 显式限制搜索，`search_complete` 会为 `false`。
 
 ## 许可与参考
 
@@ -350,3 +349,43 @@ adaptive 使用离散坐标爬山并受 `max_trials`、`max_rounds` 限制。想
 - [vLLM Bench Serve CLI](https://docs.vllm.ai/en/stable/cli/bench/serve/)
 
 License: MIT
+
+
+## 使用调优结果启动推理服务
+
+调优结束后，打开本次运行目录中的 `recommendation.json`，将 `recommended_server` 的结果填入下面命令。尖括号中的内容均为**占位符**，必须替换为项目实际输出值；不要把尖括号原样复制到 shell。
+
+以下示例启用本项目当前支持并纳入配置的优化项：**Chunked Prefill**，并使用调优得到的 TP、上下文长度、并发、Batch Tokens 和内存利用率。命令与 tuner 的 `make_server_cmd()` 保持一致：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export HCCL_BUFFSIZE=512
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+vllm serve /path/to/<MODEL_DIR> \\
+  --host 0.0.0.0 \\
+  --port 8000 \\
+  --served-model-name <SERVED_MODEL_NAME> \\
+  --tensor-parallel-size <RECOMMENDED_TENSOR_PARALLEL_SIZE> \\
+  --max-model-len <RECOMMENDED_MAX_MODEL_LEN> \\
+  --max-num-seqs <RECOMMENDED_MAX_NUM_SEQS> \\
+  --max-num-batched-tokens <RECOMMENDED_MAX_NUM_BATCHED_TOKENS> \\
+  --gpu-memory-utilization <RECOMMENDED_GPU_MEMORY_UTILIZATION> \\
+  --enable-chunked-prefill
+```
+
+参数映射示例（以下数值仅演示映射方式，不是推荐性能值）：
+
+| 启动参数 | 从哪里取得 |
+|---|---|
+| `<MODEL_DIR>` | `config.json` 的 `model` |
+| `<SERVED_MODEL_NAME>` | `config.json` 的 `served_model_name` |
+| `<RECOMMENDED_TENSOR_PARALLEL_SIZE>` | `recommendation.json` → `recommended_server.tensor_parallel_size` |
+| `<RECOMMENDED_MAX_MODEL_LEN>` | `recommendation.json` → `recommended_server.max_model_len` |
+| `<RECOMMENDED_MAX_NUM_SEQS>` | `recommendation.json` → `recommended_server.max_num_seqs` |
+| `<RECOMMENDED_MAX_NUM_BATCHED_TOKENS>` | `recommendation.json` → `recommended_server.max_num_batched_tokens` |
+| `<RECOMMENDED_GPU_MEMORY_UTILIZATION>` | `recommendation.json` → `recommended_server.gpu_memory_utilization` |
+
+> 当前 tuner 实际传入服务启动命令的优化开关是 `--enable-chunked-prefill`。KV Cache dtype、Prefix Caching、Attention Backend、CUDA Graph 或 Speculative Decoding 尚未纳入本项目的搜索与启动配置，因此这里不虚构“自动启用”。若需手动增加这些后端优化，先确认当前 vLLM/vLLM-Ascend 版本支持，并在相同 workload 下重新 benchmark；否则推荐参数的测试条件与实际部署条件不一致。
