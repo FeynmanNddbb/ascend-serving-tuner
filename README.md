@@ -121,26 +121,26 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 
 ## 4. 核心调优参数
 
-下面直接使用 `config.json` 中的**原始参数名**。表格中的“所在位置”只用于帮助你在 JSON 中找到该字段。
+下面直接使用 `config.json` 中的**原始参数名**。参数配置指南给出首次试验和逐步调整的建议；实际最佳值需由目标硬件、模型和业务负载实测确定。
 
-| 参数名（按配置原名） | 所在位置 | 示例 | 作用与调整建议 |
-|---|---|---|---|
-| `context_lengths` | `auto_tune.search_space` | `[4096, 8192, 16384, 32768, 65536, 131072]` | 输入上下文长度候选，单位 token。脚本会将 `benchmark.output_len` 加到服务端 `max_model_len`；先从 4K/8K/16K 开始，再逐步扩大。 |
-| `max_num_seqs` | `auto_tune.search_space` | `[1, 2, 4, 8, 16, 32]` | 服务端可调度的序列数上限候选。它不是客户端压测并发数。 |
-| `max_num_batched_tokens` | `auto_tune.search_space` | `[1024, 2048, 4096, 8192, 16384]` | 单次调度迭代可处理的 token 上限候选。较小可能限制 Prefill 吞吐，较大可能增加内存压力。 |
-| `gpu_memory_utilization` | `auto_tune.search_space` | `[0.80, 0.85, 0.90, 0.93]` | vLLM 设备内存利用率候选。从保守值开始，并确认当前 vLLM-Ascend 版本支持。 |
-| `benchmark_concurrency` | `auto_tune` | `[1, 2, 4, 8]` | 客户端压测并发请求数候选，用于模拟负载；不等于 `max_num_seqs`。 |
-| `objective` | `auto_tune` | `"throughput"` | 优化目标：`throughput` 最大化输出 token/s；`request_throughput` 最大化 req/s；`latency` 最小化平均 TPOT。 |
+| 参数名 | 所在位置 | 示例 | 作用 | 参数配置指南 |
+|---|---|---|---|---|
+| `context_lengths` | `auto_tune.search_space` | `[4096, 8192, 16384, 32768, 65536, 131072]` | 输入上下文长度候选，单位 token。脚本将 `benchmark.output_len` 加到服务端 `max_model_len`。 | 初次建议从 `[4096, 8192, 16384]` 开始；确认稳定后再逐级加入 32K、64K、128K。长上下文要同时关注 KV Cache、TTFT 和 OOM。 |
+| `max_num_seqs` | `auto_tune.search_space` | `[1, 2, 4, 8, 16, 32]` | 服务端可调度的序列数上限候选。 | 从 `[1, 2, 4]` 起步；吞吐仍随并发提升且延迟、内存满足限制时，再扩展到 8、16、32。它不是客户端并发。 |
+| `max_num_batched_tokens` | `auto_tune.search_space` | `[1024, 2048, 4096, 8192, 16384]` | 单次调度迭代可处理的 token 上限候选。 | 建议先用 `[1024, 2048, 4096]`；Prefill 吞吐受限时逐步提高，若启动失败、内存压力增大或延迟恶化则回退。 |
+| `gpu_memory_utilization` | `auto_tune.search_space` | `[0.80, 0.85, 0.90, 0.93]` | vLLM 设备内存利用率候选。 | 从 `0.80` 或 `0.85` 开始；稳定后再尝试更高值。不要直接设到 1.0；确认当前 vLLM-Ascend 版本支持该参数。 |
+| `benchmark_concurrency` | `auto_tune` | `[1, 2, 4, 8]` | 客户端压测并发请求数候选，用于模拟负载；不等于服务端 `max_num_seqs`。 | 先用 `[1, 2, 4]` 验证单请求和轻负载，再逐步加入 8、16；按预期线上并发设置，不要只追求最高吞吐。 |
+| `objective` | `auto_tune` | `"throughput"` | 优化目标。 | 吞吐优先选 `"throughput"`；请求处理速率优先选 `"request_throughput"`；生成流畅度优先选 `"latency"`，并配合 TPOT 上限。 |
 
 ### 性能限制（SLO）
 
-| 参数名（按配置原名） | 所在位置 | 默认示例 | 作用 |
-|---|---|---:|---|
-| `min_output_throughput` | `auto_tune.limits` | `0` | 输出吞吐最低门槛，单位 tokens/s。0 表示不设有效吞吐下限。 |
-| `max_mean_ttft_ms` | `auto_tune.limits` | `10000` | 平均首 token 延迟上限，单位 ms。 |
-| `max_mean_tpot_ms` | `auto_tune.limits` | `1000` | 平均每输出 token 时间上限，单位 ms。 |
+| 参数名 | 所在位置 | 默认示例 | 作用 | 参数配置指南 |
+|---|---|---:|---|---|
+| `min_output_throughput` | `auto_tune.limits` | `0` | 输出吞吐最低门槛，单位 tokens/s。 | `0` 表示不设有效下限。压测得到基线后，可设为业务最低吞吐要求；不要把单次波动值当硬门槛。 |
+| `max_mean_ttft_ms` | `auto_tune.limits` | `10000` | 平均首 Token 延迟上限，单位 ms。 | 默认值是宽松起步值。交互式业务可按 SLA 收紧，例如先试 2000–3000 ms；长上下文场景需结合输入长度设定。 |
+| `max_mean_tpot_ms` | `auto_tune.limits` | `1000` | 平均每输出 Token 时间上限，单位 ms。 | 默认值宽松。按生成体验要求逐步收紧，例如 80–150 ms；确认 benchmark 输出字段和单位后再设限。 |
 
-默认 SLO 是宽松起点，不是生产 SLA。可按业务收紧，例如 TTFT 2000 ms、TPOT 80 ms。若启用的指标无法从当前版本 benchmark JSON 解析，该候选不会通过约束筛选。
+以上是配置起点，不是硬件能力保证。若启用的指标无法从当前版本 benchmark JSON 解析，该候选不会通过约束筛选。
 
 ### 配置中对应的原样片段
 
