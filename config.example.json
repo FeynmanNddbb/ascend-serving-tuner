@@ -18,7 +18,7 @@
       "max_num_batched_tokens": [1024, 2048, 4096, 8192, 16384],
       "gpu_memory_utilization": [0.80, 0.85, 0.90, 0.93]
     },
-    "benchmark_concurrency": [1, 2, 4, 8],
+    "fixed_concurrency": 1,
     "max_trials": 40,
     "max_total_benchmarks": 400,
     "max_rounds": 12,
