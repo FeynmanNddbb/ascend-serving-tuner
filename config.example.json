@@ -1,4 +1,5 @@
 {
+  "mode": "adaptive",
   "model": "/workspace/work/data/models/Qwen3.8-27B-w8a8",
   "served_model_name": "qwen3.8",
   "host": "127.0.0.1",
@@ -6,8 +7,22 @@
   "visible_devices": "0,1",
   "cann_env": "/usr/local/Ascend/ascend-toolkit/set_env.sh",
   "startup_timeout_sec": 900,
-  "health_timeout_sec": 900,
   "shutdown_timeout_sec": 30,
+
+  "auto_tune": {
+    "start_context": 4096,
+    "max_context": 262144,
+    "tensor_parallel_size": 2,
+    "probe_max_num_seqs": 1,
+    "probe_max_num_batched_tokens": 2048,
+    "gpu_memory_utilization": 0.9,
+    "enable_chunked_prefill": true,
+    "probe_concurrency": 1,
+    "tune_max_num_seqs": [1, 2, 4, 8, 16, 32],
+    "tune_max_num_batched_tokens": [2048, 4096, 8192, 16384],
+    "benchmark_concurrency": [1, 2, 4, 8]
+  },
+
   "server": {
     "tensor_parallel_size": [2],
     "max_model_len": [4096, 8192, 16384],
@@ -16,15 +31,17 @@
     "gpu_memory_utilization": [0.85, 0.9],
     "enable_chunked_prefill": [true]
   },
+
   "benchmark": {
     "input_lengths": [512, 2048, 4096],
     "output_len": 128,
-    "num_prompts": 32,
-    "max_concurrency": [1, 2, 4, 8, 16],
+    "num_prompts": 16,
+    "max_concurrency": [1, 2, 4, 8],
     "backend": "openai-chat",
     "dataset_name": "random",
     "extra_args": []
   },
+
   "env": {
     "HCCL_BUFFSIZE": "512",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True"
