@@ -248,8 +248,6 @@ def rank_key(row, objective):
         return (-(float(tpot) if tpot is not None else float("inf")), throughput)
     if objective == "request_throughput":
         return (req_rate, throughput)
-    if objective == "max_capacity":
-        return (int(row.get("client_concurrency", 0)), throughput)
     return (throughput, req_rate)
 
 
@@ -262,8 +260,8 @@ def adaptive(config, runner):
         **auto.get("limits", {}),
     }
     objective = auto.get("objective", "throughput")
-    if objective not in {"throughput", "request_throughput", "latency", "max_capacity"}:
-        raise ValueError("objective must be throughput, request_throughput, latency, or max_capacity")
+    if objective not in {"throughput", "request_throughput", "latency"}:
+        raise ValueError("objective must be throughput, request_throughput, or latency")
 
     output_len = int(config["benchmark"].get("output_len", 128))
     space = auto.get("search_space", {})
@@ -283,9 +281,9 @@ def adaptive(config, runner):
 
     tp = int(auto.get("tensor_parallel_size", config.get("server", {}).get("tensor_parallel_size", [1])[0]))
     chunked = bool(auto.get("enable_chunked_prefill", True))
-    concurrencies = sorted(set(int(x) for x in auto.get("benchmark_concurrency", [1, 2, 4, 8])))
-    if not concurrencies or any(x < 1 for x in concurrencies):
-        raise ValueError("benchmark_concurrency must contain positive integers")
+    fixed_concurrency = int(config.get("benchmark", {}).get("fixed_concurrency", 1))
+    if fixed_concurrency < 1:
+        raise ValueError("benchmark.fixed_concurrency must be a positive integer")
 
     max_trials = int(auto.get("max_trials", 40))
     max_rounds = int(auto.get("max_rounds", 12))
@@ -319,10 +317,8 @@ def adaptive(config, runner):
             "enable_chunked_prefill": chunked,
         }
         configs[key] = server
-        rows = []
-        for concurrency in concurrencies:
-            rows.append(runner.trial(server, context, concurrency, "adaptive_search"))
-        metric_by_objective = {\n            "throughput": "output_throughput",\n            "request_throughput": "request_throughput",\n            "latency": "mean_tpot_ms",\n            "max_capacity": "client_concurrency",\n        }\n        metric = metric_by_objective[objective]\n        feasible = [row for row in rows if satisfies(row, limits) and row.get(metric) is not None]
+        rows = [runner.trial(server, context, fixed_concurrency, "adaptive_search_fixed_load")]
+        metric_by_objective = {\n            "throughput": "output_throughput",\n            "request_throughput": "request_throughput",\n            "latency": "mean_tpot_ms",\n        }\n        metric = metric_by_objective[objective]\n        feasible = [row for row in rows if satisfies(row, limits) and row.get(metric) is not None]
         best_row = max(feasible, key=lambda row: rank_key(row, objective)) if feasible else None
         result = (rank_key(best_row, objective), best_row) if best_row else (None, None)
         evaluated[key] = result
@@ -391,8 +387,8 @@ def adaptive(config, runner):
         "final_validation_passed": True,
         "search_method": "discrete coordinate hill-climb from minimum candidate values",
         "note": (
-            "Client concurrency may exceed server max_num_seqs; excess requests queue. "
-            "Recommendation is local to the configured discrete candidates and benchmark workload."
+            "Only server configuration is searched. A single fixed benchmark concurrency is used as a measurement condition, not as a search dimension. "
+            "Recommendation is local to the configured discrete candidates and fixed benchmark workload."
         ),
     }
     (runner.base / "recommendation.json").write_text(json.dumps(recommendation, indent=2))
