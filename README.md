@@ -121,24 +121,24 @@ python3 tuner.py --config config.json --mode adaptive --no-launch-best
 
 ## 4. 核心调优参数
 
-这部分是日常使用时最值得关注的参数。
+以下参数名与 `config.json` 中的实际 JSON 键保持一致，按配置层级书写。
 
-| 参数 | 作用 | 调整建议 |
+| 配置键 | 作用 | 调整建议 |
 |---|---|---|
-| `search_space.context_lengths` | 输入上下文长度候选；脚本会将 `output_len` 加到服务端 `max_model_len` | 从小到大设置；先测 4K/8K/16K，再逐步扩大 |
-| `search_space.max_num_seqs` | 服务端同时调度的序列数上限 | 从 1、2、4 逐步增加；它不是客户端并发数 |
-| `search_space.max_num_batched_tokens` | 单次调度迭代可处理的 token 上限 | 小值可能限制 Prefill 吞吐，大值可能增加内存压力 |
-| `search_space.gpu_memory_utilization` | vLLM 内存利用率配置 | 从保守值开始；确认当前 vLLM-Ascend 版本支持该参数 |
-| `benchmark_concurrency` | 压测客户端并发请求数 | 用来模拟业务负载；不等于 `max_num_seqs` |
-| `objective` | 选择优化目标 | `throughput` 最大化输出 token/s；`request_throughput` 最大化 req/s；`latency` 最小化平均 TPOT |
+| `auto_tune.search_space.context_lengths` | 输入上下文长度候选（token）；脚本将 `benchmark.output_len` 加到 `max_model_len` | 从小到大设置；先测 4K/8K/16K，再逐步扩大 |
+| `auto_tune.search_space.max_num_seqs` | 服务端同时调度的序列数上限候选 | 从 1、2、4 逐步增加；它不是客户端压测并发数 |
+| `auto_tune.search_space.max_num_batched_tokens` | 单次调度迭代可处理的 token 上限候选 | 小值可能限制 Prefill 吞吐，大值可能增加内存压力 |
+| `auto_tune.search_space.gpu_memory_utilization` | vLLM 设备内存利用率候选 | 从保守值开始；确认当前 vLLM-Ascend 版本支持该参数 |
+| `auto_tune.benchmark_concurrency` | 压测客户端并发请求数候选 | 用来模拟业务负载；不等于服务端 `max_num_seqs` |
+| `auto_tune.objective` | 选择优化目标 | `throughput` 最大化输出 token/s；`request_throughput` 最大化 req/s；`latency` 最小化平均 TPOT |
 
 ### 性能限制（SLO）
 
-| 参数 | 默认值 | 含义 |
+| 配置键 | 默认值 | 含义 |
 |---|---:|---|
-| `limits.min_output_throughput` | `0` tokens/s | 不设有效吞吐下限，但吞吐指标仍需可解析 |
-| `limits.max_mean_ttft_ms` | `10000` ms | 平均首 token 延迟上限，宽松起步值 |
-| `limits.max_mean_tpot_ms` | `1000` ms | 平均每输出 token 时间上限，宽松起步值 |
+| `auto_tune.limits.min_output_throughput` | `0` tokens/s | 不设有效吞吐下限，但吞吐指标仍需可解析 |
+| `auto_tune.limits.max_mean_ttft_ms` | `10000` ms | 平均首 token 延迟上限，宽松起步值 |
+| `auto_tune.limits.max_mean_tpot_ms` | `1000` ms | 平均每输出 token 时间上限，宽松起步值 |
 
 默认值是避免过早筛掉候选的起点，不是生产 SLA。可按实际业务收紧，例如 TTFT 2000 ms、TPOT 80 ms。若启用的指标无法从当前版本 benchmark JSON 解析，该候选不会通过约束筛选。
 
