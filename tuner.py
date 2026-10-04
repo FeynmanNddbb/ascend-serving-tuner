@@ -322,7 +322,8 @@ def adaptive(config, runner):
             "throughput": "output_throughput",
             "request_throughput": "request_throughput",
             "latency": "mean_tpot_ms",
-        }\n        metric = metric_by_objective[objective]\n        feasible = [row for row in rows if satisfies(row, limits) and row.get(metric) is not None]
+        }
+        metric = metric_by_objective[objective]\n        feasible = [row for row in rows if satisfies(row, limits) and row.get(metric) is not None]
         best_row = max(feasible, key=lambda row: rank_key(row, objective)) if feasible else None
         result = (rank_key(best_row, objective), best_row) if best_row else (None, None)
         evaluated[key] = result
